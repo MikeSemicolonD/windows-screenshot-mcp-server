@@ -431,7 +431,8 @@ func (wm *WindowsManager) GetWindowChildren(parent uintptr) ([]types.WindowInfo,
 
 // IsWindowTopMost checks if a window is topmost
 func (wm *WindowsManager) IsWindowTopMost(handle uintptr) bool {
-	exStyle, _, _ := getWindowLong.Call(handle, uintptr(int32(GWL_EXSTYLE)))
+	gwl := int32(GWL_EXSTYLE)
+	exStyle, _, _ := getWindowLong.Call(handle, uintptr(gwl))
 	return (exStyle & WS_EX_TOPMOST) != 0
 }
 

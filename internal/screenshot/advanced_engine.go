@@ -21,14 +21,18 @@ var (
 	// Shell functions for system tray
 	shell32                       = windows.NewLazyDLL("shell32.dll")
 	shell_NotifyIconGetRect       = shell32.NewProc("Shell_NotifyIconGetRect")
+
+	// Kernel32 for process/thread snapshot and handle management
+	kernel32                      = windows.NewLazyDLL("kernel32.dll")
+	closeHandle                   = kernel32.NewProc("CloseHandle")
 	
 	// Additional User32 functions
 	sendMessage                   = user32.NewProc("SendMessageW")
 	postMessage                   = user32.NewProc("PostMessageW")
 	enumChildWindows              = user32.NewProc("EnumChildWindows")
 	enumThreadWindows             = user32.NewProc("EnumThreadWindows")
-	getWindowThreadProcessId      = user32.NewProc("GetWindowThreadProcessId")
-	
+	// getWindowThreadProcessId is declared in engine.go
+
 	// Process and thread functions
 	createToolhelp32Snapshot      = kernel32.NewProc("CreateToolhelp32Snapshot")
 	process32First               = kernel32.NewProc("Process32FirstW")
@@ -65,6 +69,9 @@ const (
 	// Toolhelp32 constants
 	TH32CS_SNAPPROCESS = 0x00000002
 	TH32CS_SNAPTHREAD  = 0x00000004
+
+	// ShowWindow command
+	SW_MINIMIZE = 6
 	
 	// System tray constants
 	NIM_ADD    = 0x00000000
