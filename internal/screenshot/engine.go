@@ -240,8 +240,15 @@ func (e *WindowsScreenshotEngine) CaptureFullScreen(monitor int, options *types.
 	return e.CaptureByHandle(desktopHandle, options)
 }
 
-// captureVisibleWindow captures a visible window using BitBlt
+// captureVisibleWindow captures a visible window. It first tries PrintWindow with
+// PW_RENDERFULLCONTENT, which is the only reliable path for DirectComposition / GPU-
+// rendered windows (conhost.exe, Chromium, Electron, modern WinUI apps). If that fails,
+// it falls back to BitBlt from the window's own DC (works for legacy GDI apps).
 func (e *WindowsScreenshotEngine) captureVisibleWindow(handle uintptr, windowInfo *types.WindowInfo, options *types.CaptureOptions) (*types.ScreenshotBuffer, error) {
+	if buf, err := e.tryPrintWindow(handle, windowInfo, options); err == nil {
+		return buf, nil
+	}
+
 	// Get window device context
 	var hdc uintptr
 	if options.IncludeFrame {
@@ -395,10 +402,12 @@ func (e *WindowsScreenshotEngine) tryPrintWindow(handle uintptr, windowInfo *typ
 	oldBitmap, _, _ := selectObject.Call(memDC, bitmap)
 	defer selectObject.Call(memDC, oldBitmap)
 	
-	// Use PrintWindow to render to our DC
-	flags := uintptr(0)
+	// Use PrintWindow to render to our DC. PW_RENDERFULLCONTENT (Win 8.1+) is required
+	// for windows whose contents are drawn via DirectComposition / GPU compositing
+	// (conhost.exe, Chromium-based browsers, Electron apps, modern WinUI apps).
+	flags := uintptr(PW_RENDERFULLCONTENT)
 	if !options.IncludeFrame {
-		flags = PW_CLIENTONLY
+		flags |= PW_CLIENTONLY
 	}
 	
 	ret, _, _ := printWindow.Call(handle, memDC, flags)
