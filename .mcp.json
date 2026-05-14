@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+		"windows-screenshot": {
+			"command": "..\\windows-screenshot-mcp-server\\screenshot-mcp.exe",
+			"type": "stdio"
+		}
+  }
+}
