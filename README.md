@@ -137,29 +137,73 @@ Connect to `ws://localhost:8080/stream/{windowId}` for real-time streaming.
 
 ### Model Context Protocol (MCP)
 
-The server supports MCP JSON-RPC 2.0 requests via `POST /rpc`.
+In addition to the REST server, the project ships a dedicated **MCP stdio server**
+(`cmd/mcp`, built as `screenshot-mcp.exe`) for direct integration with AI agents and
+MCP clients such as Claude Code. It communicates over stdio using the MCP protocol —
+no HTTP port is involved.
 
-**Available Methods:**
-- `screenshot.capture` - Capture screenshots
-- `window.list` - List windows (placeholder)
-- `chrome.instances` - List Chrome instances
-- `chrome.tabs` - List Chrome tabs
-- `chrome.tabCapture` - Capture Chrome tab
-- `stream.status` - Get streaming status
+**Register it with an MCP client** (e.g. `.mcp.json`):
 
-**Example MCP Request:**
 ```json
 {
-  "jsonrpc": "2.0",
-  "method": "screenshot.capture",
-  "params": {
-    "method": "title",
-    "target": "Calculator",
-    "format": "png"
-  },
-  "id": 1
+  "mcpServers": {
+    "windows-screenshot": {
+      "command": "C:\\path\\to\\screenshot-mcp.exe",
+      "type": "stdio"
+    }
+  }
 }
 ```
+
+> Use an absolute path for `command` so the client can launch it regardless of its
+> working directory.
+
+#### Available Tools
+
+| Tool | Description |
+| --- | --- |
+| `capture_window_by_title` | Capture a top-level window found by title (see matching rules below). |
+| `capture_window_by_pid` | Capture the main window of a process; `hidden=true` uses DWM/PrintWindow fallbacks. |
+| `capture_window_by_handle` | Capture a window by its `HWND`. |
+| `capture_window_by_class` | Capture a window by its class name. |
+| `capture_full_screen` | Capture a single monitor by index (`0` = primary). |
+| `list_chrome_tabs` | List open tabs across all detected Chrome instances. |
+| `capture_chrome_tab` | Capture a specific Chrome tab by ID. |
+| `find_tray_apps` | Enumerate system tray applications. |
+| `find_hidden_windows` | Enumerate hidden top-level windows. |
+| `enumerate_process_windows` | List all windows owned by a process, including hidden/cloaked. |
+
+All capture tools accept `format` (`png` default, or `jpeg`) and `quality` (1-100).
+
+#### Title matching (`capture_window_by_title`)
+
+By default the `title` argument is a **case-insensitive substring** ("lazy") match —
+`"command"`, `"prompt"`, and `"Command Prompt"` all match a window titled
+*Command Prompt*. When several windows match, the best target is chosen (visible and
+non-minimized windows first, then an exact title match, then the shortest/closest
+title); other matches are listed in the result text so an agent can re-target.
+
+Two independent flags tighten the match:
+
+- `exact` — require the title to **equal** the given string in full, instead of just
+  containing it as a substring. Default `false`.
+- `case_sensitive` — make the comparison respect letter case. Default `false`.
+
+They combine freely (e.g. `exact=true, case_sensitive=false` is a full-title match
+that ignores case).
+
+#### Monitor selection (`capture_full_screen`)
+
+`monitor` is a zero-based index: `0` is the primary display, `1+` are the remaining
+monitors ordered left-to-right then top-to-bottom. An out-of-range index returns an
+error stating how many monitors are available.
+
+#### Window rendering note
+
+Visible windows are captured via `PrintWindow` with the `PW_RENDERFULLCONTENT` flag,
+which correctly captures GPU / DirectComposition-rendered surfaces such as
+`conhost.exe` (Command Prompt), Chromium-based browsers, Electron apps, and modern
+WinUI apps. It falls back to a `BitBlt` of the window DC for legacy GDI windows.
 
 ### Server Configuration
 
@@ -259,7 +303,8 @@ go test ./...
 
 ```
 ├── cmd/
-│   ├── server/          # Main server application
+│   ├── server/          # REST / WebSocket HTTP server
+│   ├── mcp/             # MCP stdio server (screenshot-mcp.exe)
 │   └── mcpctl/          # MCP control utility
 ├── internal/
 │   ├── screenshot/      # Screenshot capture engines
@@ -280,6 +325,13 @@ The server follows a modular architecture:
 - **Screenshot Engine** - Core capture functionality with multiple methods
 - **Chrome Manager** - Browser integration via DevTools protocol
 - **MCP Handler** - JSON-RPC 2.0 support for AI agents
+
+## Contributors
+
+- **[Amaf Jarkasi](https://github.com/amafjarkasi)** — original author and maintainer of the [upstream project](https://github.com/amafjarkasi/windows-screenshot-mcp-server).
+- **[Michael Frye](https://github.com/MikeSemicolonD)** — [fork](https://github.com/MikeSemicolonD/windows-screenshot-mcp-server) maintainer; MCP stdio server, lazy title matching, per-monitor capture, and `PrintWindow` rendering fixes.
+
+Contributions are welcome — please open an issue or pull request.
 
 ## License
 
