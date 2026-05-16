@@ -2,6 +2,8 @@ package screenshot
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -240,6 +242,77 @@ func (e *WindowsScreenshotEngine) FindCloakedWindows() ([]types.WindowInfo, erro
 	enumWindows.Call(callback, 0)
 	
 	return cloakedWindows, nil
+}
+
+// FindWindowsByTitle returns every top-level window whose title matches needle.
+// The flags are independent: caseSensitive controls whether the comparison
+// respects letter case; exact controls whether the title must equal needle in
+// full (true) or merely contain it as a substring (false). Results are ordered
+// so the most useful capture target comes first: visible, non-minimized windows
+// before others; within each group an exact title match before a partial one;
+// then by ascending title length (a shorter title is a closer match).
+func (e *WindowsScreenshotEngine) FindWindowsByTitle(needle string, caseSensitive, exact bool) ([]types.WindowInfo, error) {
+	want := needle
+	if !caseSensitive {
+		want = strings.ToLower(needle)
+	}
+
+	var matches []types.WindowInfo
+	callback := syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
+		titleLen, _, _ := getWindowTextLengthW.Call(hwnd)
+		if titleLen == 0 {
+			return 1 // skip windows with no title
+		}
+		info, err := e.getWindowInfo(hwnd)
+		if err != nil || info.Title == "" {
+			return 1
+		}
+		hay := info.Title
+		if !caseSensitive {
+			hay = strings.ToLower(hay)
+		}
+		var hit bool
+		if exact {
+			hit = hay == want
+		} else {
+			hit = want == "" || strings.Contains(hay, want)
+		}
+		if hit {
+			matches = append(matches, *info)
+		}
+		return 1 // continue enumeration
+	})
+	enumWindows.Call(callback, 0)
+
+	// rank yields a sort key: lower is a better capture target.
+	rank := func(w types.WindowInfo) (usable, exactMatch, length int) {
+		usable = 1
+		if w.State == "visible" {
+			usable = 0
+		}
+		exactMatch = 1
+		t, s := w.Title, needle
+		if !caseSensitive {
+			t, s = strings.ToLower(t), strings.ToLower(s)
+		}
+		if t == s {
+			exactMatch = 0
+		}
+		return usable, exactMatch, len(w.Title)
+	}
+	sort.SliceStable(matches, func(i, j int) bool {
+		ai, bi, ci := rank(matches[i])
+		aj, bj, cj := rank(matches[j])
+		if ai != aj {
+			return ai < aj
+		}
+		if bi != bj {
+			return bi < bj
+		}
+		return ci < cj
+	})
+
+	return matches, nil
 }
 
 // CaptureHiddenByPID captures a screenshot of any window from a process, including hidden ones

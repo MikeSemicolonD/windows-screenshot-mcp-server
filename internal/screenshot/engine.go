@@ -3,6 +3,7 @@ package screenshot
 import (
 	"fmt"
 	"runtime"
+	"sort"
 	"syscall"
 	"time"
 	"unsafe"
@@ -36,6 +37,8 @@ var (
 	getWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
 	enumWindows           = user32.NewProc("EnumWindows")
 	getClassName          = user32.NewProc("GetClassNameW")
+	enumDisplayMonitors   = user32.NewProc("EnumDisplayMonitors")
+	getMonitorInfoW       = user32.NewProc("GetMonitorInfoW")
 	
 	// GDI32 functions
 	createCompatibleDC    = gdi32.NewProc("CreateCompatibleDC")
@@ -71,7 +74,16 @@ const (
 	DWMWA_EXTENDED_FRAME_BOUNDS = 9
 	PROCESS_DPI_AWARE   = 1
 	MDT_EFFECTIVE_DPI   = 0
+	MONITORINFOF_PRIMARY = 0x1
 )
+
+// MONITORINFO structure for GetMonitorInfoW
+type MONITORINFO struct {
+	CbSize    uint32
+	RcMonitor RECT
+	RcWork    RECT
+	DwFlags   uint32
+}
 
 // RECT structure for Windows API
 type RECT struct {
@@ -229,15 +241,149 @@ func (e *WindowsScreenshotEngine) CaptureByClassName(className string, options *
 	return e.CaptureByHandle(handle, options)
 }
 
-// CaptureFullScreen captures the full screen
-func (e *WindowsScreenshotEngine) CaptureFullScreen(monitor int, options *types.CaptureOptions) (*types.ScreenshotBuffer, error) {
-	// Get desktop window handle
-	desktopHandle, _, _ := getDesktopWindow.Call()
-	if desktopHandle == 0 {
-		return nil, fmt.Errorf("failed to get desktop window")
+// monitorInfo describes one physical display in virtual-screen coordinates.
+type monitorInfo struct {
+	rect      RECT
+	isPrimary bool
+}
+
+// enumerateMonitors returns every connected monitor. The slice is ordered so
+// that index 0 is the primary display, with the remaining monitors sorted
+// left-to-right then top-to-bottom by their virtual-screen position.
+func (e *WindowsScreenshotEngine) enumerateMonitors() ([]monitorInfo, error) {
+	var monitors []monitorInfo
+
+	callback := syscall.NewCallback(func(hMonitor, hdcMonitor, lprcMonitor, dwData uintptr) uintptr {
+		var mi MONITORINFO
+		mi.CbSize = uint32(unsafe.Sizeof(mi))
+		ret, _, _ := getMonitorInfoW.Call(hMonitor, uintptr(unsafe.Pointer(&mi)))
+		if ret != 0 {
+			monitors = append(monitors, monitorInfo{
+				rect:      mi.RcMonitor,
+				isPrimary: mi.DwFlags&MONITORINFOF_PRIMARY != 0,
+			})
+		}
+		return 1 // continue enumeration
+	})
+
+	ret, _, _ := enumDisplayMonitors.Call(0, 0, callback, 0)
+	if ret == 0 {
+		return nil, fmt.Errorf("EnumDisplayMonitors failed")
 	}
-	
-	return e.CaptureByHandle(desktopHandle, options)
+	if len(monitors) == 0 {
+		return nil, fmt.Errorf("no monitors found")
+	}
+
+	sort.SliceStable(monitors, func(i, j int) bool {
+		if monitors[i].isPrimary != monitors[j].isPrimary {
+			return monitors[i].isPrimary // primary first
+		}
+		if monitors[i].rect.Left != monitors[j].rect.Left {
+			return monitors[i].rect.Left < monitors[j].rect.Left
+		}
+		return monitors[i].rect.Top < monitors[j].rect.Top
+	})
+
+	return monitors, nil
+}
+
+// CaptureFullScreen captures a single monitor. monitor is an index into the
+// display list: 0 is the primary monitor, higher indices are the remaining
+// displays ordered left-to-right then top-to-bottom.
+func (e *WindowsScreenshotEngine) CaptureFullScreen(monitor int, options *types.CaptureOptions) (*types.ScreenshotBuffer, error) {
+	if options == nil {
+		options = types.DefaultCaptureOptions()
+	}
+
+	monitors, err := e.enumerateMonitors()
+	if err != nil {
+		return nil, err
+	}
+	if monitor < 0 || monitor >= len(monitors) {
+		return nil, fmt.Errorf("monitor index %d out of range: %d monitor(s) available (valid indices 0-%d)",
+			monitor, len(monitors), len(monitors)-1)
+	}
+
+	m := monitors[monitor].rect
+	rect := types.Rectangle{
+		X:      int(m.Left),
+		Y:      int(m.Top),
+		Width:  int(m.Right - m.Left),
+		Height: int(m.Bottom - m.Top),
+	}
+
+	buffer, err := e.captureScreenRect(rect)
+	if err != nil {
+		return nil, fmt.Errorf("failed to capture monitor %d: %w", monitor, err)
+	}
+	buffer.Timestamp = time.Now()
+	return buffer, nil
+}
+
+// captureScreenRect copies a rectangle of the virtual screen into a buffer via
+// BitBlt. Coordinates are in virtual-screen space and may be negative for
+// monitors positioned left of or above the primary display.
+func (e *WindowsScreenshotEngine) captureScreenRect(rect types.Rectangle) (*types.ScreenshotBuffer, error) {
+	if rect.Width <= 0 || rect.Height <= 0 {
+		return nil, fmt.Errorf("invalid screen dimensions: %dx%d", rect.Width, rect.Height)
+	}
+
+	// Screen DC covers the whole virtual desktop.
+	screenDC, _, _ := getDC.Call(0)
+	if screenDC == 0 {
+		return nil, fmt.Errorf("failed to get screen DC")
+	}
+	defer releaseDC.Call(0, screenDC)
+
+	memDC, _, _ := createCompatibleDC.Call(screenDC)
+	if memDC == 0 {
+		return nil, fmt.Errorf("failed to create compatible DC")
+	}
+	defer deleteDC.Call(memDC)
+
+	var bmi BITMAPINFO
+	bmi.Header.Size = uint32(unsafe.Sizeof(bmi.Header))
+	bmi.Header.Width = int32(rect.Width)
+	bmi.Header.Height = -int32(rect.Height) // top-down DIB
+	bmi.Header.Planes = 1
+	bmi.Header.BitCount = 32
+	bmi.Header.Compression = BI_RGB
+
+	var pBits uintptr
+	bitmap, _, _ := createDIBSection.Call(memDC, uintptr(unsafe.Pointer(&bmi)), DIB_RGB_COLORS, uintptr(unsafe.Pointer(&pBits)), 0, 0)
+	if bitmap == 0 {
+		return nil, fmt.Errorf("failed to create DIB section")
+	}
+	defer deleteObject.Call(bitmap)
+
+	oldBitmap, _, _ := selectObject.Call(memDC, bitmap)
+	defer selectObject.Call(memDC, oldBitmap)
+
+	ret, _, _ := bitBlt.Call(
+		memDC, 0, 0, uintptr(rect.Width), uintptr(rect.Height),
+		screenDC, uintptr(rect.X), uintptr(rect.Y), SRCCOPY,
+	)
+	if ret == 0 {
+		return nil, fmt.Errorf("BitBlt failed")
+	}
+
+	dpiX, _, _ := getDeviceCaps.Call(screenDC, LOGPIXELSX)
+
+	pixelCount := rect.Width * rect.Height * 4
+	pixelData := make([]byte, pixelCount)
+	if pBits != 0 {
+		copy(pixelData, (*[1 << 30]byte)(unsafe.Pointer(pBits))[:pixelCount:pixelCount])
+	}
+
+	return &types.ScreenshotBuffer{
+		Data:       pixelData,
+		Width:      rect.Width,
+		Height:     rect.Height,
+		Stride:     rect.Width * 4,
+		Format:     "BGRA32",
+		DPI:        int(dpiX),
+		SourceRect: rect,
+	}, nil
 }
 
 // captureVisibleWindow captures a visible window. It first tries PrintWindow with

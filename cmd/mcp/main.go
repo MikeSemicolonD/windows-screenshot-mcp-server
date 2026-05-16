@@ -49,8 +49,10 @@ func main() {
 
 func registerTools(s *server.MCPServer) {
 	s.AddTool(mcp.NewTool("capture_window_by_title",
-		mcp.WithDescription("Capture a screenshot of a top-level window whose title contains the given substring (case-sensitive)."),
-		mcp.WithString("title", mcp.Required(), mcp.Description("Window title or substring to match")),
+		mcp.WithDescription("Capture a screenshot of a top-level window found by title. By default the title is matched case-insensitively as a substring (a \"lazy\" match): \"command\", \"prompt\", and \"Command Prompt\" all match a window titled \"Command Prompt\". When several windows match, the best target is captured (visible and non-minimized windows first, then an exact title match, then the shortest/closest title) and any other matches are listed in the result text so you can re-target. Two independent flags tighten the match: exact=true requires the title to equal the given string in full instead of just containing it; case_sensitive=true makes the comparison respect letter case. They combine freely (e.g. exact=true with case_sensitive=false is a full-title match ignoring case)."),
+		mcp.WithString("title", mcp.Required(), mcp.Description("Window title to match. By default this is a case-insensitive substring (lazy match); see the exact and case_sensitive flags to tighten it.")),
+		mcp.WithBoolean("exact", mcp.Description("Require the window title to equal the given string in full, instead of the default substring (contains) match. Default false.")),
+		mcp.WithBoolean("case_sensitive", mcp.Description("Make the title comparison respect letter case. Default false (case-insensitive).")),
 		mcp.WithString("format", mcp.Description("Image format: png (default) or jpeg")),
 		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100 (default 90)")),
 		mcp.WithBoolean("include_cursor", mcp.Description("Include the mouse cursor in the capture")),
@@ -79,8 +81,8 @@ func registerTools(s *server.MCPServer) {
 	), captureByClass)
 
 	s.AddTool(mcp.NewTool("capture_full_screen",
-		mcp.WithDescription("Capture a full monitor."),
-		mcp.WithNumber("monitor", mcp.Description("Monitor index (0 = primary, default 0)")),
+		mcp.WithDescription("Capture a screenshot of a single monitor in full. The monitor argument selects which display: 0 is the primary monitor (default), and higher indices are the remaining displays ordered left-to-right then top-to-bottom. An out-of-range index returns an error stating how many monitors are available."),
+		mcp.WithNumber("monitor", mcp.Description("Zero-based monitor index: 0 = primary display (default), 1+ = additional displays ordered left-to-right then top-to-bottom")),
 		mcp.WithString("format", mcp.Description("png (default) or jpeg")),
 		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100")),
 	), captureFullScreen)
@@ -184,6 +186,20 @@ func defaultOptions() *types.CaptureOptions {
 
 // --- tool handlers ---
 
+// titleMatchDesc describes a title match mode in plain words, e.g.
+// "case-insensitive substring match" or "case-sensitive exact match".
+func titleMatchDesc(caseSensitive, exact bool) string {
+	cs := "case-insensitive"
+	if caseSensitive {
+		cs = "case-sensitive"
+	}
+	kind := "substring"
+	if exact {
+		kind = "exact"
+	}
+	return cs + " " + kind + " match"
+}
+
 func captureByTitle(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	title := argString(args, "title", "")
@@ -192,13 +208,44 @@ func captureByTitle(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	}
 	opts := defaultOptions()
 	opts.IncludeCursor = argBool(args, "include_cursor", false)
+	format, quality := captureFormat(args)
 
-	buf, err := engine.CaptureByTitle(title, opts)
+	exact := argBool(args, "exact", false)
+	caseSensitive := argBool(args, "case_sensitive", false)
+	mode := titleMatchDesc(caseSensitive, exact)
+
+	matches, err := engine.FindWindowsByTitle(title, caseSensitive, exact)
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("window search failed", err), nil
+	}
+	if len(matches) == 0 {
+		return mcp.NewToolResultError(fmt.Sprintf("no top-level window title matched %q (%s)", title, mode)), nil
+	}
+
+	target := matches[0]
+	buf, err := engine.CaptureByHandle(target.Handle, opts)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
 	}
-	format, quality := captureFormat(args)
-	return imageResult(buf, fmt.Sprintf("window %q", title), format, quality)
+
+	label := fmt.Sprintf("window %q (%s for %q)", target.Title, mode, title)
+	if len(matches) > 1 {
+		const maxList = 5
+		others := make([]string, 0, maxList)
+		for _, m := range matches[1:] {
+			if len(others) == maxList {
+				break
+			}
+			others = append(others, fmt.Sprintf("%q [hwnd 0x%x]", m.Title, m.Handle))
+		}
+		more := ""
+		if len(matches)-1 > len(others) {
+			more = fmt.Sprintf(" (+%d more)", len(matches)-1-len(others))
+		}
+		label = fmt.Sprintf("%s — %d other window(s) also matched: %s%s",
+			label, len(matches)-1, strings.Join(others, ", "), more)
+	}
+	return imageResult(buf, label, format, quality)
 }
 
 func captureByPID(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

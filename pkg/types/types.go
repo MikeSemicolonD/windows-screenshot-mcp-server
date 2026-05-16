@@ -191,6 +191,13 @@ type ScreenshotEngine interface {
 	FindSystemTrayApps() ([]WindowInfo, error)
 	FindHiddenWindows() ([]WindowInfo, error)
 	FindCloakedWindows() ([]WindowInfo, error)
+
+	// FindWindowsByTitle returns every top-level window whose title matches
+	// the given needle. The two flags are independent: caseSensitive controls
+	// whether the comparison respects letter case; exact controls whether the
+	// title must equal the needle in full (true) or merely contain it as a
+	// substring (false). Visible, non-minimized windows are listed first.
+	FindWindowsByTitle(needle string, caseSensitive, exact bool) ([]WindowInfo, error)
 }
 
 // WindowManager defines window management operations
