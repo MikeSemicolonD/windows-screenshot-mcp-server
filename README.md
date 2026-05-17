@@ -329,7 +329,7 @@ The server follows a modular architecture:
 ## Contributors
 
 - **[Amaf Jarkasi](https://github.com/amafjarkasi)** — original author and maintainer of the [upstream project](https://github.com/amafjarkasi/windows-screenshot-mcp-server).
-- **[Michael Frye](https://github.com/MikeSemicolonD)** — [fork](https://github.com/MikeSemicolonD/windows-screenshot-mcp-server) maintainer; MCP stdio server, lazy title matching, per-monitor capture, and `PrintWindow` rendering fixes.
+- **[Michael Frye](https://github.com/MikeSemicolonD)** — [fork](https://github.com/MikeSemicolonD/windows-screenshot-mcp-server) maintainer; MCP stdio server, lazy title matching, per-monitor capture, and `PrintWindow` rendering fixes, GPU accelerated captures.
 
 Contributions are welcome — please open an issue or pull request.
 

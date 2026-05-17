@@ -51,6 +51,7 @@ Capture a top-level window located by its title.
 | `format` | string | no | `png` | `png` or `jpeg`. |
 | `quality` | number | no | `90` | JPEG quality 1–100. |
 | `include_cursor` | boolean | no | `false` | Include the mouse cursor in the capture. |
+| `gpu` | boolean | no | `false` | Use the GPU-accelerated Windows.Graphics.Capture path instead of `PrintWindow`/`BitBlt`. See [GPU-accelerated capture](#gpu-accelerated-capture). |
 
 `exact` and `case_sensitive` are independent and combine freely — e.g. `exact=true`
 with `case_sensitive=false` is a full-title match that ignores case.
@@ -89,6 +90,7 @@ Capture a window by its `HWND`.
 | `handle` | number | yes | — | Window handle (HWND) as an integer. |
 | `format` | string | no | `png` | `png` or `jpeg`. |
 | `quality` | number | no | `90` | JPEG quality 1–100. |
+| `gpu` | boolean | no | `false` | Use the GPU-accelerated Windows.Graphics.Capture path instead of `PrintWindow`/`BitBlt`. See [GPU-accelerated capture](#gpu-accelerated-capture). |
 
 HWNDs are returned by the discovery tools below. They are valid only for the lifetime
 of the window — re-enumerate rather than caching them.
@@ -114,6 +116,25 @@ Capture one monitor in full.
 | `quality` | number | no | `90` | JPEG quality 1–100. |
 
 An out-of-range `monitor` index returns an error stating how many monitors are available.
+
+### GPU-accelerated capture
+
+`capture_window_by_title` and `capture_window_by_handle` accept a `gpu` flag. When set,
+the window is captured through the **Windows.Graphics.Capture** API instead of the
+default `PrintWindow`/`BitBlt` path.
+
+WGC captures the window as composited by the Desktop Window Manager on the GPU, so it
+faithfully reproduces DirectComposition and hardware-rendered content (Chromium and
+Electron apps, modern WinUI apps, hardware-accelerated video) that the GDI paths can
+render incorrectly or as black. The summary text of a GPU capture is tagged `[GPU]`.
+
+Notes and limitations:
+
+- Requires **Windows 10 1803 or newer**.
+- The target must be a normal top-level window. Special windows such as the desktop
+  shell (`Program Manager`) are rejected by the OS and return a capture error.
+- The cursor is excluded unless `include_cursor` is set (where the OS build supports
+  the toggle).
 
 ---
 

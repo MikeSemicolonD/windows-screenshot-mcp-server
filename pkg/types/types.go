@@ -198,6 +198,12 @@ type ScreenshotEngine interface {
 	// title must equal the needle in full (true) or merely contain it as a
 	// substring (false). Visible, non-minimized windows are listed first.
 	FindWindowsByTitle(needle string, caseSensitive, exact bool) ([]WindowInfo, error)
+
+	// CaptureGPU captures a top-level window through the Windows.Graphics.Capture
+	// API. The capture is GPU-composited by the Desktop Window Manager, which
+	// reliably reproduces DirectComposition / hardware-rendered content. Requires
+	// Windows 10 1803 or newer.
+	CaptureGPU(handle uintptr, options *CaptureOptions) (*ScreenshotBuffer, error)
 }
 
 // WindowManager defines window management operations

@@ -56,6 +56,7 @@ func registerTools(s *server.MCPServer) {
 		mcp.WithString("format", mcp.Description("Image format: png (default) or jpeg")),
 		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100 (default 90)")),
 		mcp.WithBoolean("include_cursor", mcp.Description("Include the mouse cursor in the capture")),
+		mcp.WithBoolean("gpu", mcp.Description("Use the GPU-accelerated Windows.Graphics.Capture path instead of PrintWindow/BitBlt. Reliably reproduces DirectComposition / hardware-rendered content. Requires Windows 10 1803+.")),
 	), captureByTitle)
 
 	s.AddTool(mcp.NewTool("capture_window_by_pid",
@@ -71,6 +72,7 @@ func registerTools(s *server.MCPServer) {
 		mcp.WithNumber("handle", mcp.Required(), mcp.Description("Window handle (HWND) as integer")),
 		mcp.WithString("format", mcp.Description("png (default) or jpeg")),
 		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100")),
+		mcp.WithBoolean("gpu", mcp.Description("Use the GPU-accelerated Windows.Graphics.Capture path instead of PrintWindow/BitBlt. Reliably reproduces DirectComposition / hardware-rendered content. Requires Windows 10 1803+.")),
 	), captureByHandle)
 
 	s.AddTool(mcp.NewTool("capture_window_by_class",
@@ -223,12 +225,21 @@ func captureByTitle(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	}
 
 	target := matches[0]
-	buf, err := engine.CaptureByHandle(target.Handle, opts)
+	useGPU := argBool(args, "gpu", false)
+	var buf *types.ScreenshotBuffer
+	if useGPU {
+		buf, err = engine.CaptureGPU(target.Handle, opts)
+	} else {
+		buf, err = engine.CaptureByHandle(target.Handle, opts)
+	}
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
 	}
 
 	label := fmt.Sprintf("window %q (%s for %q)", target.Title, mode, title)
+	if useGPU {
+		label += " [GPU]"
+	}
 	if len(matches) > 1 {
 		const maxList = 5
 		others := make([]string, 0, maxList)
@@ -276,12 +287,20 @@ func captureByHandle(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolR
 	if handle == 0 {
 		return mcp.NewToolResultError("handle is required"), nil
 	}
-	buf, err := engine.CaptureByHandle(handle, defaultOptions())
+	var buf *types.ScreenshotBuffer
+	var err error
+	label := fmt.Sprintf("hwnd 0x%x", handle)
+	if argBool(args, "gpu", false) {
+		buf, err = engine.CaptureGPU(handle, defaultOptions())
+		label += " [GPU]"
+	} else {
+		buf, err = engine.CaptureByHandle(handle, defaultOptions())
+	}
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
 	}
 	format, quality := captureFormat(args)
-	return imageResult(buf, fmt.Sprintf("hwnd 0x%x", handle), format, quality)
+	return imageResult(buf, label, format, quality)
 }
 
 func captureByClass(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
