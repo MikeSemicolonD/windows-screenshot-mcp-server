@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -48,32 +49,51 @@ func main() {
 	}
 }
 
+// Downscaling (max_width / scale) is the highest-leverage knob for agents: it
+// cuts both encode time and payload size, so prefer it when you only need to
+// see a window rather than read fine text at full resolution. The same two
+// params below are added to every capture tool.
+const (
+	maxWidthDesc = "Downscale so the image is at most this many pixels wide, preserving aspect ratio (e.g. 1280). 0 or omitted = full resolution. Smaller images encode faster and use far less payload."
+	scaleDesc    = "Downscale factor between 0 and 1 (e.g. 0.5 = half width and height). If both scale and max_width are given, the smaller result wins. Never upscales."
+	regionDesc   = "Optional sub-rectangle to keep, as [x, y, width, height] in pixels relative to the top-left of the capture. Cropped before any downscale, cutting the payload further. Omit to keep the whole capture."
+)
+
 func registerTools(s *server.MCPServer) {
 	s.AddTool(mcp.NewTool("capture_window_by_title",
 		mcp.WithDescription("Capture a screenshot of a top-level window found by title. By default the title is matched case-insensitively as a substring (a \"lazy\" match): \"command\", \"prompt\", and \"Command Prompt\" all match a window titled \"Command Prompt\". When several windows match, the best target is captured (visible and non-minimized windows first, then an exact title match, then the shortest/closest title) and any other matches are listed in the result text so you can re-target. Two independent flags tighten the match: exact=true requires the title to equal the given string in full instead of just containing it; case_sensitive=true makes the comparison respect letter case. They combine freely (e.g. exact=true with case_sensitive=false is a full-title match ignoring case)."),
 		mcp.WithString("title", mcp.Required(), mcp.Description("Window title to match. By default this is a case-insensitive substring (lazy match); see the exact and case_sensitive flags to tighten it.")),
 		mcp.WithBoolean("exact", mcp.Description("Require the window title to equal the given string in full, instead of the default substring (contains) match. Default false.")),
 		mcp.WithBoolean("case_sensitive", mcp.Description("Make the title comparison respect letter case. Default false (case-insensitive).")),
-		mcp.WithString("format", mcp.Description("Image format: png (default) or jpeg")),
+		mcp.WithString("format", mcp.Description("Image format: png, jpeg, or omit to auto-pick (PNG for flat UI, JPEG for photographic/video)")),
 		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100 (default 90)")),
 		mcp.WithBoolean("include_cursor", mcp.Description("Include the mouse cursor in the capture")),
 		mcp.WithBoolean("gpu", mcp.Description("Use the GPU-accelerated Windows.Graphics.Capture path instead of PrintWindow/BitBlt. Reliably reproduces DirectComposition / hardware-rendered content. Requires Windows 10 1803+.")),
+		mcp.WithNumber("max_width", mcp.Description(maxWidthDesc)),
+		mcp.WithNumber("scale", mcp.Description(scaleDesc)),
+		mcp.WithArray("region", mcp.Description(regionDesc), mcp.WithNumberItems()),
 	), captureByTitle)
 
 	s.AddTool(mcp.NewTool("capture_window_by_pid",
 		mcp.WithDescription("Capture a screenshot of the main window of a process. If hidden=true, uses DWM thumbnail / PrintWindow fallbacks for invisible windows."),
 		mcp.WithNumber("pid", mcp.Required(), mcp.Description("Process ID")),
-		mcp.WithString("format", mcp.Description("png (default) or jpeg")),
+		mcp.WithString("format", mcp.Description("png, jpeg, or omit to auto-pick (PNG for flat UI, JPEG for photographic/video)")),
 		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100")),
 		mcp.WithBoolean("hidden", mcp.Description("Use the hidden-window capture path")),
+		mcp.WithNumber("max_width", mcp.Description(maxWidthDesc)),
+		mcp.WithNumber("scale", mcp.Description(scaleDesc)),
+		mcp.WithArray("region", mcp.Description(regionDesc), mcp.WithNumberItems()),
 	), captureByPID)
 
 	s.AddTool(mcp.NewTool("capture_window_by_handle",
 		mcp.WithDescription("Capture a screenshot of a window by its HWND."),
 		mcp.WithNumber("handle", mcp.Required(), mcp.Description("Window handle (HWND) as integer")),
-		mcp.WithString("format", mcp.Description("png (default) or jpeg")),
+		mcp.WithString("format", mcp.Description("png, jpeg, or omit to auto-pick (PNG for flat UI, JPEG for photographic/video)")),
 		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100")),
 		mcp.WithBoolean("gpu", mcp.Description("Use the GPU-accelerated Windows.Graphics.Capture path instead of PrintWindow/BitBlt. Reliably reproduces DirectComposition / hardware-rendered content. Requires Windows 10 1803+.")),
+		mcp.WithNumber("max_width", mcp.Description(maxWidthDesc)),
+		mcp.WithNumber("scale", mcp.Description(scaleDesc)),
+		mcp.WithArray("region", mcp.Description(regionDesc), mcp.WithNumberItems()),
 	), captureByHandle)
 
 	s.AddTool(mcp.NewTool("capture_burst",
@@ -85,21 +105,30 @@ func registerTools(s *server.MCPServer) {
 		mcp.WithString("format", mcp.Description("png or jpeg (default jpeg for burst, to keep the payload small)")),
 		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100 (default 80)")),
 		mcp.WithBoolean("include_cursor", mcp.Description("Include the mouse cursor in each frame")),
-		mcp.WithBoolean("gpu", mcp.Description("Use the GPU-accelerated Windows.Graphics.Capture path. Note: this re-initializes per frame and is slower for bursts; prefer leaving it off unless you need DirectComposition content.")),
+		mcp.WithBoolean("gpu", mcp.Description("Use the GPU-accelerated Windows.Graphics.Capture path. The burst reuses one capture session across all frames, so it is reasonably efficient; use it when you need DirectComposition / hardware-rendered content (Chromium, video, WinUI).")),
+		mcp.WithNumber("max_width", mcp.Description(maxWidthDesc)),
+		mcp.WithNumber("scale", mcp.Description(scaleDesc)),
+		mcp.WithArray("region", mcp.Description(regionDesc), mcp.WithNumberItems()),
 	), captureBurst)
 
 	s.AddTool(mcp.NewTool("capture_window_by_class",
 		mcp.WithDescription("Capture a screenshot of a window by its class name."),
 		mcp.WithString("class_name", mcp.Required(), mcp.Description("Window class name")),
-		mcp.WithString("format", mcp.Description("png (default) or jpeg")),
+		mcp.WithString("format", mcp.Description("png, jpeg, or omit to auto-pick (PNG for flat UI, JPEG for photographic/video)")),
 		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100")),
+		mcp.WithNumber("max_width", mcp.Description(maxWidthDesc)),
+		mcp.WithNumber("scale", mcp.Description(scaleDesc)),
+		mcp.WithArray("region", mcp.Description(regionDesc), mcp.WithNumberItems()),
 	), captureByClass)
 
 	s.AddTool(mcp.NewTool("capture_full_screen",
 		mcp.WithDescription("Capture a screenshot of a single monitor in full. The monitor argument selects which display: 0 is the primary monitor (default), and higher indices are the remaining displays ordered left-to-right then top-to-bottom. An out-of-range index returns an error stating how many monitors are available."),
 		mcp.WithNumber("monitor", mcp.Description("Zero-based monitor index: 0 = primary display (default), 1+ = additional displays ordered left-to-right then top-to-bottom")),
-		mcp.WithString("format", mcp.Description("png (default) or jpeg")),
+		mcp.WithString("format", mcp.Description("png, jpeg, or omit to auto-pick (PNG for flat UI, JPEG for photographic/video)")),
 		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100")),
+		mcp.WithNumber("max_width", mcp.Description(maxWidthDesc)),
+		mcp.WithNumber("scale", mcp.Description(scaleDesc)),
+		mcp.WithArray("region", mcp.Description(regionDesc), mcp.WithNumberItems()),
 	), captureFullScreen)
 
 	s.AddTool(mcp.NewTool("list_chrome_tabs",
@@ -109,8 +138,11 @@ func registerTools(s *server.MCPServer) {
 	s.AddTool(mcp.NewTool("capture_chrome_tab",
 		mcp.WithDescription("Capture a screenshot of a specific Chrome tab by tab ID (from list_chrome_tabs)."),
 		mcp.WithString("tab_id", mcp.Required(), mcp.Description("Chrome tab ID")),
-		mcp.WithString("format", mcp.Description("png (default) or jpeg")),
+		mcp.WithString("format", mcp.Description("png, jpeg, or omit to auto-pick (PNG for flat UI, JPEG for photographic/video)")),
 		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100")),
+		mcp.WithNumber("max_width", mcp.Description(maxWidthDesc)),
+		mcp.WithNumber("scale", mcp.Description(scaleDesc)),
+		mcp.WithArray("region", mcp.Description(regionDesc), mcp.WithNumberItems()),
 	), captureChromeTab)
 
 	s.AddTool(mcp.NewTool("find_tray_apps",
@@ -159,31 +191,83 @@ func argInt64(args map[string]any, key string, def int64) int64 {
 	return def
 }
 
-// captureFormat resolves the requested format and quality from args.
-func captureFormat(args map[string]any) (types.ImageFormat, int) {
-	format := strings.ToLower(argString(args, "format", "png"))
-	quality := int(argInt64(args, "quality", 90))
-	switch format {
-	case "jpeg", "jpg":
-		return types.FormatJPEG, quality
-	default:
-		return types.FormatPNG, quality
-	}
+// outputOpts bundles the post-capture encoding choices shared by every capture
+// tool: format/quality, an optional crop region, and optional downscaling.
+type outputOpts struct {
+	format   types.ImageFormat
+	quality  int
+	region   *types.Rectangle // nil = whole capture
+	maxWidth int              // 0 = no width cap
+	scale    float64          // 0 = no scale factor
 }
 
-// imageResult encodes a buffer and returns it as MCP image + summary text.
-func imageResult(buffer *types.ScreenshotBuffer, label string, format types.ImageFormat, quality int) (*mcp.CallToolResult, error) {
-	encoded, err := imgProc.Encode(buffer, format, quality)
+// outputFromArgs reads the shared output arguments. When format is omitted it
+// resolves to FormatAuto, letting the encoder pick PNG (flat UI) or JPEG
+// (photographic/video) by sampling the image. defaultFormat overrides that
+// fallback (burst passes JPEG to keep its multi-image payload small).
+func outputFromArgs(args map[string]any, defaultFormat types.ImageFormat) outputOpts {
+	o := outputOpts{
+		quality:  int(argInt64(args, "quality", 90)),
+		maxWidth: int(argInt64(args, "max_width", 0)),
+		region:   regionFromArgs(args),
+	}
+	if v, ok := args["scale"].(float64); ok {
+		o.scale = v
+	}
+	switch strings.ToLower(argString(args, "format", "")) {
+	case "jpeg", "jpg":
+		o.format = types.FormatJPEG
+	case "png":
+		o.format = types.FormatPNG
+	default:
+		o.format = defaultFormat
+	}
+	return o
+}
+
+// regionFromArgs parses the optional region crop, given as [x, y, width, height]
+// in capture pixels. Returns nil when absent or malformed.
+func regionFromArgs(args map[string]any) *types.Rectangle {
+	raw, ok := args["region"].([]any)
+	if !ok || len(raw) < 4 {
+		return nil
+	}
+	toInt := func(v any) int {
+		if f, ok := v.(float64); ok {
+			return int(f)
+		}
+		return 0
+	}
+	w, h := toInt(raw[2]), toInt(raw[3])
+	if w <= 0 || h <= 0 {
+		return nil
+	}
+	return &types.Rectangle{X: toInt(raw[0]), Y: toInt(raw[1]), Width: w, Height: h}
+}
+
+// mimeFor maps a concrete image format to its MIME type.
+func mimeFor(format types.ImageFormat) string {
+	if format == types.FormatJPEG {
+		return "image/jpeg"
+	}
+	return "image/png"
+}
+
+// imageResult encodes a buffer (optionally cropped/downscaled, format auto-picked)
+// and returns it as an MCP image + summary text.
+func imageResult(buffer *types.ScreenshotBuffer, label string, out outputOpts) (*mcp.CallToolResult, error) {
+	encoded, w, h, chosen, err := imgProc.EncodeScaled(buffer, out.format, out.quality, out.region, out.maxWidth, out.scale)
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("encode failed", err), nil
 	}
-	mime := "image/png"
-	if format == types.FormatJPEG {
-		mime = "image/jpeg"
-	}
+	mime := mimeFor(chosen)
 	b64 := base64.StdEncoding.EncodeToString(encoded)
 
-	summary := fmt.Sprintf("Captured %s — %dx%d, %d bytes (%s)", label, buffer.Width, buffer.Height, len(encoded), mime)
+	dims := fmt.Sprintf("%dx%d", w, h)
+	if w != buffer.Width || h != buffer.Height {
+		dims = fmt.Sprintf("%dx%d (from %dx%d capture)", w, h, buffer.Width, buffer.Height)
+	}
+	summary := fmt.Sprintf("Captured %s — %s, %d bytes (%s)", label, dims, len(encoded), mime)
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
@@ -223,7 +307,7 @@ func captureByTitle(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	}
 	opts := defaultOptions()
 	opts.IncludeCursor = argBool(args, "include_cursor", false)
-	format, quality := captureFormat(args)
+	out := outputFromArgs(args, types.FormatAuto)
 
 	exact := argBool(args, "exact", false)
 	caseSensitive := argBool(args, "case_sensitive", false)
@@ -269,7 +353,7 @@ func captureByTitle(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 		label = fmt.Sprintf("%s — %d other window(s) also matched: %s%s",
 			label, len(matches)-1, strings.Join(others, ", "), more)
 	}
-	return imageResult(buf, label, format, quality)
+	return imageResult(buf, label, out)
 }
 
 func captureByPID(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -290,8 +374,8 @@ func captureByPID(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
 	}
-	format, quality := captureFormat(args)
-	return imageResult(buf, fmt.Sprintf("pid %d", pid), format, quality)
+	out := outputFromArgs(args, types.FormatAuto)
+	return imageResult(buf, fmt.Sprintf("pid %d", pid), out)
 }
 
 func captureByHandle(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -312,8 +396,8 @@ func captureByHandle(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolR
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
 	}
-	format, quality := captureFormat(args)
-	return imageResult(buf, label, format, quality)
+	out := outputFromArgs(args, types.FormatAuto)
+	return imageResult(buf, label, out)
 }
 
 const (
@@ -361,25 +445,52 @@ func captureBurst(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 		count = maxCount
 	}
 
-	// Burst defaults to JPEG q80 to keep the multi-image payload manageable.
-	format := types.FormatJPEG
-	mime := "image/jpeg"
-	if strings.EqualFold(argString(args, "format", "jpeg"), "png") {
-		format = types.FormatPNG
-		mime = "image/png"
-	}
-	quality := int(argInt64(args, "quality", 80))
+	// Burst defaults to JPEG to keep the multi-image payload manageable, and keeps
+	// the format concrete (no auto-pick) so every frame encodes identically.
+	out := outputFromArgs(args, types.FormatJPEG)
+	out.quality = int(argInt64(args, "quality", 80))
+	mime := mimeFor(out.format)
 
 	opts := defaultOptions()
 	opts.IncludeCursor = argBool(args, "include_cursor", false)
 	useGPU := argBool(args, "gpu", false)
 
-	contents := make([]mcp.Content, 0, count+1)
+	// For a GPU burst, build one capture session and reuse it across frames —
+	// CaptureGPU would otherwise rebuild the whole Direct3D pipeline per frame.
+	// The session locks this goroutine's OS thread until Close, which is fine:
+	// every Capture() call below runs on this same goroutine.
+	var gpuSess types.GPUCaptureSession
+	if useGPU {
+		s, err := engine.NewGPUSession(handle, opts)
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("gpu session failed", err), nil
+		}
+		gpuSess = s
+		defer gpuSess.Close()
+	}
+
+	// Capture is paced sequentially on this goroutine to keep the cadence
+	// accurate, but each frame's encode + base64 (the expensive part) is handed
+	// to a worker so it overlaps the wait before the next capture. Every frame
+	// owns its own buffer, so the in-place BGRA conversion is safe in parallel.
+	type frame struct {
+		b64  string
+		size int
+		w, h int
+	}
 	var (
-		captured   int
-		totalBytes int
-		failures   []string
+		wg           sync.WaitGroup
+		mu           sync.Mutex
+		encoded      = make(map[int]frame, count)
+		failures     []string
+		origW, origH int
 	)
+	addFailure := func(s string) {
+		mu.Lock()
+		failures = append(failures, s)
+		mu.Unlock()
+	}
+
 	start := time.Now()
 	for i := 0; i < count; i++ {
 		// Pace frames against an absolute schedule so capture/encode time does
@@ -390,7 +501,7 @@ func captureBurst(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 				select {
 				case <-ctx.Done():
 					timer.Stop()
-					failures = append(failures, "cancelled before all frames were captured")
+					addFailure("cancelled before all frames were captured")
 					goto done
 				case <-timer.C:
 				}
@@ -402,24 +513,48 @@ func captureBurst(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 			err error
 		)
 		if useGPU {
-			buf, err = engine.CaptureGPU(handle, opts)
+			buf, err = gpuSess.Capture()
 		} else {
 			buf, err = engine.CaptureByHandle(handle, opts)
 		}
 		if err != nil {
-			failures = append(failures, fmt.Sprintf("frame %d: %v", i+1, err))
+			addFailure(fmt.Sprintf("frame %d: %v", i+1, err))
 			continue
 		}
-		encoded, err := imgProc.Encode(buf, format, quality)
-		if err != nil {
-			failures = append(failures, fmt.Sprintf("frame %d encode: %v", i+1, err))
-			continue
+		if origW == 0 {
+			origW, origH = buf.Width, buf.Height
 		}
-		contents = append(contents, mcp.NewImageContent(base64.StdEncoding.EncodeToString(encoded), mime))
-		captured++
-		totalBytes += len(encoded)
+
+		wg.Add(1)
+		go func(idx int, b *types.ScreenshotBuffer) {
+			defer wg.Done()
+			enc, w, h, _, err := imgProc.EncodeScaled(b, out.format, out.quality, out.region, out.maxWidth, out.scale)
+			if err != nil {
+				addFailure(fmt.Sprintf("frame %d encode: %v", idx+1, err))
+				return
+			}
+			f := frame{b64: base64.StdEncoding.EncodeToString(enc), size: len(enc), w: w, h: h}
+			mu.Lock()
+			encoded[idx] = f
+			mu.Unlock()
+		}(i, buf)
 	}
 done:
+	wg.Wait()
+
+	// Assemble frames in capture order.
+	contents := make([]mcp.Content, 0, len(encoded)+1)
+	var totalBytes, finalW, finalH int
+	for i := 0; i < count; i++ {
+		f, ok := encoded[i]
+		if !ok {
+			continue
+		}
+		contents = append(contents, mcp.NewImageContent(f.b64, mime))
+		totalBytes += f.size
+		finalW, finalH = f.w, f.h
+	}
+	captured := len(contents)
 
 	if captured == 0 {
 		msg := "burst captured no frames"
@@ -429,8 +564,12 @@ done:
 		return mcp.NewToolResultError(msg), nil
 	}
 
-	summary := fmt.Sprintf("Burst of %s — %d frame(s)%s over %s, ~%dms apart, %d bytes total (%s)",
-		targetLabel, captured, noteAdjusted, time.Since(start).Round(time.Millisecond),
+	dims := fmt.Sprintf("%dx%d", finalW, finalH)
+	if finalW != origW || finalH != origH {
+		dims = fmt.Sprintf("%dx%d (downscaled from %dx%d)", finalW, finalH, origW, origH)
+	}
+	summary := fmt.Sprintf("Burst of %s — %d frame(s)%s at %s over %s, ~%dms apart, %d bytes total (%s)",
+		targetLabel, captured, noteAdjusted, dims, time.Since(start).Round(time.Millisecond),
 		interval.Milliseconds(), totalBytes, mime)
 	if len(failures) > 0 {
 		summary += fmt.Sprintf(" — %d issue(s): %s", len(failures), strings.Join(failures, "; "))
@@ -451,8 +590,8 @@ func captureByClass(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
 	}
-	format, quality := captureFormat(args)
-	return imageResult(buf, fmt.Sprintf("class %q", class), format, quality)
+	out := outputFromArgs(args, types.FormatAuto)
+	return imageResult(buf, fmt.Sprintf("class %q", class), out)
 }
 
 func captureFullScreen(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -462,8 +601,8 @@ func captureFullScreen(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToo
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
 	}
-	format, quality := captureFormat(args)
-	return imageResult(buf, fmt.Sprintf("monitor %d", monitor), format, quality)
+	out := outputFromArgs(args, types.FormatAuto)
+	return imageResult(buf, fmt.Sprintf("monitor %d", monitor), out)
 }
 
 func listChromeTabs(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -524,8 +663,8 @@ func captureChromeTab(_ context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
 	}
-	format, quality := captureFormat(args)
-	return imageResult(buf, fmt.Sprintf("chrome tab %q", target.Title), format, quality)
+	out := outputFromArgs(args, types.FormatAuto)
+	return imageResult(buf, fmt.Sprintf("chrome tab %q", target.Title), out)
 }
 
 func findTrayApps(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {

@@ -9,6 +9,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -26,14 +27,14 @@ var pngEncoder = png.Encoder{CompressionLevel: png.BestSpeed}
 // ImageProcessor implements image processing and encoding operations
 type ImageProcessor struct {
 	defaultQuality int
-	outputDir     string
+	outputDir      string
 }
 
 // NewImageProcessor creates a new image processor
 func NewImageProcessor() *ImageProcessor {
 	return &ImageProcessor{
 		defaultQuality: 95,
-		outputDir:     "screenshots",
+		outputDir:      "screenshots",
 	}
 }
 
@@ -54,8 +55,133 @@ func (p *ImageProcessor) Encode(buffer *types.ScreenshotBuffer, format types.Ima
 		return nil, fmt.Errorf("failed to convert buffer to image: %w", err)
 	}
 
-	// Encode to bytes
+	if format == types.FormatAuto {
+		format = chooseFormat(img)
+	}
+	return p.encodeImage(img, format, quality)
+}
+
+// EncodeScaled is like Encode but optionally crops to a region and downscales
+// the image before encoding, and resolves FormatAuto by sampling the image.
+//
+// Pipeline order: convert → crop (region) → downscale (scale / max_width) →
+// encode. Cropping and downscaling both shrink the encode cost and payload —
+// the highest-leverage knobs for agents that only need part of a window, or
+// only need to "see" it rather than read it at full resolution.
+//
+//   - region (optional) selects a sub-rectangle in capture pixels; it is
+//     clamped to the image bounds.
+//   - the downscale target is the smaller of scale (a 0<scale<1 multiplier) and
+//     max_width (a hard cap on width). The image is never upscaled.
+//
+// The returned width/height are the dimensions actually encoded, and chosen is
+// the concrete format used (resolved from FormatAuto when applicable).
+func (p *ImageProcessor) EncodeScaled(buffer *types.ScreenshotBuffer, format types.ImageFormat, quality int, region *types.Rectangle, maxWidth int, scale float64) (data []byte, width, height int, chosen types.ImageFormat, err error) {
+	if buffer == nil {
+		return nil, 0, 0, "", fmt.Errorf("buffer cannot be nil")
+	}
+	img, err := p.ToImage(buffer)
+	if err != nil {
+		return nil, 0, 0, "", fmt.Errorf("failed to convert buffer to image: %w", err)
+	}
+
+	if region != nil {
+		crop := image.Rect(region.X, region.Y, region.X+region.Width, region.Y+region.Height).
+			Intersect(img.Bounds())
+		if crop.Empty() {
+			return nil, 0, 0, "", fmt.Errorf("region %dx%d at (%d,%d) lies outside the %dx%d capture",
+				region.Width, region.Height, region.X, region.Y, buffer.Width, buffer.Height)
+		}
+		img = imaging.Crop(img, crop)
+	}
+
+	width, height = img.Bounds().Dx(), img.Bounds().Dy()
+	if nw, nh, resize := targetSize(width, height, scale, maxWidth); resize {
+		// Linear (bilinear) balances speed against legibility for downscaling;
+		// the resize is cheap relative to the encode it shrinks.
+		img = imaging.Resize(img, nw, nh, imaging.Linear)
+		width, height = nw, nh
+	}
+
+	chosen = format
+	if chosen == types.FormatAuto {
+		chosen = chooseFormat(img)
+	}
+	data, err = p.encodeImage(img, chosen, quality)
+	return data, width, height, chosen, err
+}
+
+// chooseFormat picks an encoding format by sampling the image's colour
+// diversity. Photographic / video content has most pixels unique, so JPEG is
+// far smaller and faster; flat UI content repeats a small palette, where PNG is
+// smaller and keeps text crisp. The sample is a coarse grid, so the cost is
+// negligible relative to the encode it informs.
+func chooseFormat(img image.Image) types.ImageFormat {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 {
+		return types.FormatPNG
+	}
+	const grid = 96 // up to grid*grid samples
+	stepX, stepY := w/grid, h/grid
+	if stepX < 1 {
+		stepX = 1
+	}
+	if stepY < 1 {
+		stepY = 1
+	}
+	seen := make(map[uint32]struct{}, grid*grid)
+	samples := 0
+	for y := b.Min.Y; y < b.Max.Y; y += stepY {
+		for x := b.Min.X; x < b.Max.X; x += stepX {
+			r, g, bl, _ := img.At(x, y).RGBA() // 16-bit per channel
+			key := uint32(r>>8)<<16 | uint32(g>>8)<<8 | uint32(bl>>8)
+			seen[key] = struct{}{}
+			samples++
+		}
+	}
+	if samples == 0 {
+		return types.FormatPNG
+	}
+	// Photographic content tends well above this unique-colour ratio; flat UI
+	// sits well below it.
+	if float64(len(seen))/float64(samples) > 0.5 {
+		return types.FormatJPEG
+	}
+	return types.FormatPNG
+}
+
+// targetSize returns the dimensions to downscale to and whether a resize is
+// needed. scale (0<scale<1) and maxWidth combine by taking the smaller factor;
+// the image is never upscaled.
+func targetSize(w, h int, scale float64, maxWidth int) (int, int, bool) {
+	s := 1.0
+	if scale > 0 && scale < 1 {
+		s = scale
+	}
+	if maxWidth > 0 && w > maxWidth {
+		if ms := float64(maxWidth) / float64(w); ms < s {
+			s = ms
+		}
+	}
+	if s >= 1.0 || w <= 0 || h <= 0 {
+		return w, h, false
+	}
+	nw := int(math.Round(float64(w) * s))
+	nh := int(math.Round(float64(h) * s))
+	if nw < 1 {
+		nw = 1
+	}
+	if nh < 1 {
+		nh = 1
+	}
+	return nw, nh, true
+}
+
+// encodeImage encodes an already-prepared image to the requested format.
+func (p *ImageProcessor) encodeImage(img image.Image, format types.ImageFormat, quality int) ([]byte, error) {
 	var buf bytes.Buffer
+	var err error
 	switch format {
 	case types.FormatPNG:
 		err = pngEncoder.Encode(&buf, img)
@@ -94,7 +220,7 @@ func (p *ImageProcessor) EncodeToWriter(buffer *types.ScreenshotBuffer, format t
 	if err != nil {
 		return err
 	}
-	
+
 	_, err = writer.Write(data)
 	return err
 }
@@ -213,7 +339,7 @@ func (p *ImageProcessor) Crop(buffer *types.ScreenshotBuffer, rect types.Rectang
 
 	// Define crop rectangle
 	cropRect := image.Rect(rect.X, rect.Y, rect.X+rect.Width, rect.Y+rect.Height)
-	
+
 	// Ensure crop rectangle is within bounds
 	bounds := img.Bounds()
 	cropRect = cropRect.Intersect(bounds)
@@ -262,38 +388,36 @@ func (p *ImageProcessor) ToImage(buffer *types.ScreenshotBuffer) (image.Image, e
 	return img, nil
 }
 
-// bgraToRGBA converts BGRA data to RGBA format
+// bgraToRGBA converts BGRA data to RGBA in place and returns an image that
+// wraps the buffer's own pixel slice — no second multi-megabyte buffer is
+// allocated, which removes the per-capture allocation and the GC pressure it
+// creates during a burst. Only the B and R channels are swapped (G and A are
+// already in position). The buffer's Format is flipped to RGBA32 afterwards so
+// a repeat conversion of the same buffer is a no-op rather than swapping the
+// channels back. Callers therefore must treat buffer.Data as consumed once it
+// has been encoded.
 func (p *ImageProcessor) bgraToRGBA(buffer *types.ScreenshotBuffer) image.Image {
-	// Create new RGBA image
-	rgba := image.NewRGBA(image.Rect(0, 0, buffer.Width, buffer.Height))
-
-	// Convert BGRA -> RGBA: swap the B and R channels. We slice both buffers to
-	// the same 4-pixel-aligned length up front so the inner loop carries no
-	// per-iteration bounds check (the previous code re-checked i+3 every step).
-	src := buffer.Data
-	dst := rgba.Pix
-	n := len(src)
-	if len(dst) < n {
-		n = len(dst)
-	}
+	pix := buffer.Data
+	n := len(pix)
 	n -= n % 4
-	src = src[:n]
-	dst = dst[:n]
+	pix = pix[:n]
 	for i := 0; i < n; i += 4 {
-		dst[i] = src[i+2]   // R = B
-		dst[i+1] = src[i+1] // G = G
-		dst[i+2] = src[i]   // B = R
-		dst[i+3] = src[i+3] // A = A
+		pix[i], pix[i+2] = pix[i+2], pix[i] // swap B <-> R
 	}
 
-	return rgba
+	buffer.Format = "RGBA32"
+	return &image.RGBA{
+		Pix:    buffer.Data,
+		Stride: buffer.Stride,
+		Rect:   image.Rect(0, 0, buffer.Width, buffer.Height),
+	}
 }
 
 // imageToBuffer converts an image.Image back to ScreenshotBuffer
 func (p *ImageProcessor) imageToBuffer(img image.Image) *types.ScreenshotBuffer {
 	bounds := img.Bounds()
 	rgba := image.NewRGBA(bounds)
-	
+
 	// Copy image data to RGBA
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
@@ -365,7 +489,7 @@ func (fs *FileSystemStorage) Save(buffer *types.ScreenshotBuffer, format types.I
 	now := time.Now()
 	dateDir := now.Format(fs.dateFormat)
 	fullDir := filepath.Join(fs.baseDir, dateDir)
-	
+
 	// Ensure directory exists
 	if err := os.MkdirAll(fullDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create directory structure: %w", err)
@@ -384,7 +508,7 @@ func (fs *FileSystemStorage) Save(buffer *types.ScreenshotBuffer, format types.I
 	default:
 		ext = "png"
 	}
-	
+
 	filename := fmt.Sprintf("%s_%s.%s", name, timestamp, ext)
 	fullPath := filepath.Join(fullDir, filename)
 

@@ -44,9 +44,9 @@ const (
 	// DirectXPixelFormat.B8G8R8A8UIntNormalized — matches our BGRA32 buffers.
 	pixelFormatBGRA8 = 87
 
-	d3dDriverHardware = 1 // D3D_DRIVER_TYPE_HARDWARE
-	d3dDriverWARP     = 5 // D3D_DRIVER_TYPE_WARP (software fallback)
-	d3d11SDKVersion   = 7 // D3D11_SDK_VERSION
+	d3dDriverHardware = 1    // D3D_DRIVER_TYPE_HARDWARE
+	d3dDriverWARP     = 5    // D3D_DRIVER_TYPE_WARP (software fallback)
+	d3d11SDKVersion   = 7    // D3D11_SDK_VERSION
 	d3d11BGRASupport  = 0x20 // D3D11_CREATE_DEVICE_BGRA_SUPPORT
 
 	d3d11UsageStaging  = 3       // D3D11_USAGE_STAGING
@@ -197,11 +197,44 @@ func createD3DDevice() (device, context uintptr, err error) {
 	return 0, 0, err
 }
 
+// gpuSession is a reusable Windows.Graphics.Capture pipeline. The Direct3D
+// device, frame pool, and capture session are created once and kept alive so a
+// burst of captures pays the (large) setup cost only on the first frame. All
+// methods must run on the goroutine that created the session, because WinRT
+// requires the calls to stay on the single OS thread locked at creation.
+type gpuSession struct {
+	device    uintptr
+	context   uintptr
+	item      uintptr
+	framePool uintptr
+	session   uintptr
+}
+
 // CaptureGPU captures a window using the Windows.Graphics.Capture API. handle
 // must be a top-level window handle. The capture is GPU-composited by the
 // Desktop Window Manager, so it reliably reproduces DirectComposition and
 // hardware-rendered content. Requires Windows 10 1803 or newer.
 func (e *WindowsScreenshotEngine) CaptureGPU(handle uintptr, options *types.CaptureOptions) (*types.ScreenshotBuffer, error) {
+	sess, err := e.NewGPUSession(handle, options)
+	if err != nil {
+		return nil, err
+	}
+	defer sess.Close()
+
+	buffer, err := sess.Capture()
+	if err != nil {
+		return nil, err
+	}
+	if info, infoErr := e.getWindowInfo(handle); infoErr == nil {
+		buffer.WindowInfo = *info
+	}
+	return buffer, nil
+}
+
+// NewGPUSession builds the full WGC pipeline for a window and starts capturing.
+// The returned session must be Close()d on the same goroutine. It locks the OS
+// thread for its lifetime, since WinRT calls cannot migrate between threads.
+func (e *WindowsScreenshotEngine) NewGPUSession(handle uintptr, options *types.CaptureOptions) (types.GPUCaptureSession, error) {
 	if handle == 0 {
 		return nil, fmt.Errorf("invalid window handle")
 	}
@@ -211,106 +244,94 @@ func (e *WindowsScreenshotEngine) CaptureGPU(handle uintptr, options *types.Capt
 
 	// WinRT calls must stay on a single, initialized OS thread.
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 
-	if hr, _, _ := roInitialize.Call(uintptr(roInitMultiThreaded)); failed(hr) && uint32(hr) != rpcEChangedMode {
-		return nil, fmt.Errorf("RoInitialize failed: 0x%08X", uint32(hr))
-	}
-
-	buffer, err := e.captureViaWGC(handle, options)
-	if err != nil {
+	s := &gpuSession{}
+	// On any setup failure, release whatever we acquired and unlock the thread.
+	fail := func(err error) (types.GPUCaptureSession, error) {
+		s.releaseAll()
+		runtime.UnlockOSThread()
 		return nil, fmt.Errorf("Windows.Graphics.Capture failed: %w", err)
 	}
 
-	buffer.Timestamp = time.Now()
-	if info, infoErr := e.getWindowInfo(handle); infoErr == nil {
-		buffer.WindowInfo = *info
+	if hr, _, _ := roInitialize.Call(uintptr(roInitMultiThreaded)); failed(hr) && uint32(hr) != rpcEChangedMode {
+		return fail(fmt.Errorf("RoInitialize failed: 0x%08X", uint32(hr)))
 	}
-	return buffer, nil
-}
 
-// captureViaWGC performs the full WGC capture pipeline for a window handle.
-func (e *WindowsScreenshotEngine) captureViaWGC(handle uintptr, options *types.CaptureOptions) (*types.ScreenshotBuffer, error) {
 	// --- Direct3D 11 device ---
 	device, context, err := createD3DDevice()
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
-	defer comRelease(device)
-	defer comRelease(context)
+	s.device, s.context = device, context
 
 	var dxgiDevice uintptr
 	if hr := comCall(device, 0, uintptr(unsafe.Pointer(&iidDXGIDevice)), uintptr(unsafe.Pointer(&dxgiDevice))); failed(hr) {
-		return nil, fmt.Errorf("QueryInterface(IDXGIDevice) failed: 0x%08X", uint32(hr))
+		return fail(fmt.Errorf("QueryInterface(IDXGIDevice) failed: 0x%08X", uint32(hr)))
 	}
 	defer comRelease(dxgiDevice)
 
 	// Wrap the DXGI device as a WinRT IDirect3DDevice for the frame pool.
 	var rtDevice uintptr
 	if hr, _, _ := createDirect3D11DeviceFromDXGIDevice.Call(dxgiDevice, uintptr(unsafe.Pointer(&rtDevice))); failed(hr) {
-		return nil, fmt.Errorf("CreateDirect3D11DeviceFromDXGIDevice failed: 0x%08X", uint32(hr))
+		return fail(fmt.Errorf("CreateDirect3D11DeviceFromDXGIDevice failed: 0x%08X", uint32(hr)))
 	}
 	defer comRelease(rtDevice)
 
 	// --- GraphicsCaptureItem for the target window ---
 	interop, err := activationFactory("Windows.Graphics.Capture.GraphicsCaptureItem", &iidGraphicsCaptureItemInterop)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	defer comRelease(interop)
 
-	var item uintptr
 	// IGraphicsCaptureItemInterop::CreateForWindow (vtable index 3).
-	if hr := comCall(interop, 3, handle, uintptr(unsafe.Pointer(&iidGraphicsCaptureItem)), uintptr(unsafe.Pointer(&item))); failed(hr) {
-		return nil, fmt.Errorf("CreateForWindow failed (window may not be capturable): 0x%08X", uint32(hr))
+	if hr := comCall(interop, 3, handle, uintptr(unsafe.Pointer(&iidGraphicsCaptureItem)), uintptr(unsafe.Pointer(&s.item))); failed(hr) {
+		return fail(fmt.Errorf("CreateForWindow failed (window may not be capturable): 0x%08X", uint32(hr)))
 	}
-	defer comRelease(item)
 
 	var size sizeInt32
 	// IGraphicsCaptureItem::get_Size (vtable index 7).
-	if hr := comCall(item, 7, uintptr(unsafe.Pointer(&size))); failed(hr) {
-		return nil, fmt.Errorf("GraphicsCaptureItem.Size failed: 0x%08X", uint32(hr))
+	if hr := comCall(s.item, 7, uintptr(unsafe.Pointer(&size))); failed(hr) {
+		return fail(fmt.Errorf("GraphicsCaptureItem.Size failed: 0x%08X", uint32(hr)))
 	}
 	if size.Width <= 0 || size.Height <= 0 {
-		return nil, fmt.Errorf("capture item reported an empty size (%dx%d)", size.Width, size.Height)
+		return fail(fmt.Errorf("capture item reported an empty size (%dx%d)", size.Width, size.Height))
 	}
 
 	// --- Free-threaded frame pool + capture session ---
 	statics2, err := activationFactory("Windows.Graphics.Capture.Direct3D11CaptureFramePool", &iidFramePoolStatics2)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	defer comRelease(statics2)
 
 	// SizeInt32 is an 8-byte struct, passed by value in one register.
 	sizeArg := uintptr(uint32(size.Width)) | uintptr(uint32(size.Height))<<32
-	var framePool uintptr
 	// IDirect3D11CaptureFramePoolStatics2::CreateFreeThreaded (vtable index 6).
-	if hr := comCall(statics2, 6, rtDevice, uintptr(pixelFormatBGRA8), 2, sizeArg, uintptr(unsafe.Pointer(&framePool))); failed(hr) {
-		return nil, fmt.Errorf("CreateFreeThreaded frame pool failed: 0x%08X", uint32(hr))
+	if hr := comCall(statics2, 6, rtDevice, uintptr(pixelFormatBGRA8), 2, sizeArg, uintptr(unsafe.Pointer(&s.framePool))); failed(hr) {
+		return fail(fmt.Errorf("CreateFreeThreaded frame pool failed: 0x%08X", uint32(hr)))
 	}
-	defer comRelease(framePool)
-	defer comClose(framePool)
 
-	var session uintptr
 	// IDirect3D11CaptureFramePool::CreateCaptureSession (vtable index 10).
-	if hr := comCall(framePool, 10, item, uintptr(unsafe.Pointer(&session))); failed(hr) {
-		return nil, fmt.Errorf("CreateCaptureSession failed: 0x%08X", uint32(hr))
+	if hr := comCall(s.framePool, 10, s.item, uintptr(unsafe.Pointer(&s.session))); failed(hr) {
+		return fail(fmt.Errorf("CreateCaptureSession failed: 0x%08X", uint32(hr)))
 	}
-	defer comRelease(session)
-	defer comClose(session)
 
-	configureSession(session, options)
+	configureSession(s.session, options)
 
 	// IGraphicsCaptureSession::StartCapture (vtable index 6).
-	if hr := comCall(session, 6); failed(hr) {
-		return nil, fmt.Errorf("StartCapture failed: 0x%08X", uint32(hr))
+	if hr := comCall(s.session, 6); failed(hr) {
+		return fail(fmt.Errorf("StartCapture failed: 0x%08X", uint32(hr)))
 	}
 
-	// --- Poll for the first composited frame ---
-	frame, err := waitForFrame(framePool)
+	return s, nil
+}
+
+// Capture grabs the latest composited frame and returns it as a BGRA32 buffer.
+func (s *gpuSession) Capture() (*types.ScreenshotBuffer, error) {
+	frame, err := waitForFrame(s.framePool)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Windows.Graphics.Capture failed: %w", err)
 	}
 	defer comRelease(frame)
 	defer comClose(frame)
@@ -336,7 +357,32 @@ func (e *WindowsScreenshotEngine) captureViaWGC(handle uintptr, options *types.C
 	}
 	defer comRelease(texture)
 
-	return readTexture(device, context, texture)
+	buffer, err := readTexture(s.device, s.context, texture)
+	if err != nil {
+		return nil, err
+	}
+	buffer.Timestamp = time.Now()
+	return buffer, nil
+}
+
+// Close releases the GPU resources and unlocks the capture thread.
+func (s *gpuSession) Close() error {
+	s.releaseAll()
+	runtime.UnlockOSThread()
+	return nil
+}
+
+// releaseAll frees every COM resource the session holds, in reverse order of
+// acquisition. It is safe to call with partially-initialised fields.
+func (s *gpuSession) releaseAll() {
+	comClose(s.session)
+	comRelease(s.session)
+	comClose(s.framePool)
+	comRelease(s.framePool)
+	comRelease(s.item)
+	comRelease(s.context)
+	comRelease(s.device)
+	*s = gpuSession{}
 }
 
 // waitForFrame polls the frame pool until a frame is available or it times out.

@@ -19,14 +19,14 @@ type ScreenshotRequest struct {
 // ScreenshotResponse represents the response containing screenshot data
 type ScreenshotResponse struct {
 	Success   bool      `json:"success"`
-	Data      string    `json:"data"`       // Base64 encoded image data
-	Format    string    `json:"format"`     // Actual format used
-	Width     int       `json:"width"`      // Image width
-	Height    int       `json:"height"`     // Image height
-	Size      int64     `json:"size"`       // Size in bytes
-	Timestamp time.Time `json:"timestamp"`  // When captured
-	Metadata  Metadata  `json:"metadata"`   // Additional metadata
-	Error     string    `json:"error"`      // Error message if failed
+	Data      string    `json:"data"`      // Base64 encoded image data
+	Format    string    `json:"format"`    // Actual format used
+	Width     int       `json:"width"`     // Image width
+	Height    int       `json:"height"`    // Image height
+	Size      int64     `json:"size"`      // Size in bytes
+	Timestamp time.Time `json:"timestamp"` // When captured
+	Metadata  Metadata  `json:"metadata"`  // Additional metadata
+	Error     string    `json:"error"`     // Error message if failed
 }
 
 // WindowInfo contains information about a window
@@ -47,15 +47,15 @@ type WindowInfo struct {
 
 // ChromeTab represents a Chrome browser tab
 type ChromeTab struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	URL         string `json:"url"`
-	Type        string `json:"type"`
-	Description string `json:"description"`
-	WindowID    int    `json:"windowId"`
-	DevToolsURL string `json:"devtoolsFrontendUrl"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	URL          string `json:"url"`
+	Type         string `json:"type"`
+	Description  string `json:"description"`
+	WindowID     int    `json:"windowId"`
+	DevToolsURL  string `json:"devtoolsFrontendUrl"`
 	WebSocketURL string `json:"webSocketDebuggerUrl"`
-	Active      bool   `json:"active"`
+	Active       bool   `json:"active"`
 }
 
 // ChromeInstance represents a Chrome browser instance
@@ -90,13 +90,13 @@ type Size struct {
 
 // MonitorInfo contains information about a display monitor
 type MonitorInfo struct {
-	Index     int       `json:"index"`
-	Primary   bool      `json:"primary"`
-	Rect      Rectangle `json:"rect"`
-	WorkArea  Rectangle `json:"work_area"`
-	DPI       int       `json:"dpi"`
-	ScaleFactor float64 `json:"scale_factor"`
-	Name      string    `json:"name"`
+	Index       int       `json:"index"`
+	Primary     bool      `json:"primary"`
+	Rect        Rectangle `json:"rect"`
+	WorkArea    Rectangle `json:"work_area"`
+	DPI         int       `json:"dpi"`
+	ScaleFactor float64   `json:"scale_factor"`
+	Name        string    `json:"name"`
 }
 
 // ImageFormat represents supported image formats
@@ -107,19 +107,22 @@ const (
 	FormatJPEG ImageFormat = "jpeg"
 	FormatBMP  ImageFormat = "bmp"
 	FormatWebP ImageFormat = "webp"
+	// FormatAuto defers the choice to the encoder, which samples the image and
+	// picks PNG for flat/UI content or JPEG for photographic/video content.
+	FormatAuto ImageFormat = "auto"
 )
 
 // ScreenshotBuffer contains raw image data with metadata
 type ScreenshotBuffer struct {
-	Data        []byte     `json:"-"`      // Raw image data (BGRA)
-	Width       int        `json:"width"`
-	Height      int        `json:"height"`
-	Stride      int        `json:"stride"`  // Bytes per row
-	Format      string     `json:"format"`  // "BGRA32"
-	DPI         int        `json:"dpi"`
-	Timestamp   time.Time  `json:"timestamp"`
-	SourceRect  Rectangle  `json:"source_rect"`
-	WindowInfo  WindowInfo `json:"window_info"`
+	Data        []byte      `json:"-"` // Raw image data (BGRA)
+	Width       int         `json:"width"`
+	Height      int         `json:"height"`
+	Stride      int         `json:"stride"` // Bytes per row
+	Format      string      `json:"format"` // "BGRA32"
+	DPI         int         `json:"dpi"`
+	Timestamp   time.Time   `json:"timestamp"`
+	SourceRect  Rectangle   `json:"source_rect"`
+	WindowInfo  WindowInfo  `json:"window_info"`
 	MonitorInfo MonitorInfo `json:"monitor_info"`
 }
 
@@ -136,15 +139,15 @@ type Metadata struct {
 
 // StreamSession represents an active streaming session
 type StreamSession struct {
-	ID        string      `json:"id"`
-	WindowID  uintptr     `json:"window_id"`
-	FPS       int         `json:"fps"`
-	Quality   int         `json:"quality"`
-	Format    ImageFormat `json:"format"`
-	Active    bool        `json:"active"`
-	StartTime time.Time   `json:"start_time"`
-	FrameCount int64      `json:"frame_count"`
-	BytesSent  int64      `json:"bytes_sent"`
+	ID         string      `json:"id"`
+	WindowID   uintptr     `json:"window_id"`
+	FPS        int         `json:"fps"`
+	Quality    int         `json:"quality"`
+	Format     ImageFormat `json:"format"`
+	Active     bool        `json:"active"`
+	StartTime  time.Time   `json:"start_time"`
+	FrameCount int64       `json:"frame_count"`
+	BytesSent  int64       `json:"bytes_sent"`
 }
 
 // MCPRequest represents a JSON-RPC 2.0 request
@@ -180,12 +183,12 @@ type ScreenshotEngine interface {
 	CaptureByPID(pid uint32, options *CaptureOptions) (*ScreenshotBuffer, error)
 	CaptureByClassName(className string, options *CaptureOptions) (*ScreenshotBuffer, error)
 	CaptureFullScreen(monitor int, options *CaptureOptions) (*ScreenshotBuffer, error)
-	
+
 	// Advanced capture methods for hidden/tray applications
 	CaptureHiddenByPID(pid uint32, options *CaptureOptions) (*ScreenshotBuffer, error)
 	CaptureTrayApp(processName string, options *CaptureOptions) (*ScreenshotBuffer, error)
 	CaptureWithFallbacks(handle uintptr, options *CaptureOptions) (*ScreenshotBuffer, error)
-	
+
 	// Window discovery methods
 	EnumerateAllProcessWindows(pid uint32) ([]WindowInfo, error)
 	FindSystemTrayApps() ([]WindowInfo, error)
@@ -204,25 +207,42 @@ type ScreenshotEngine interface {
 	// reliably reproduces DirectComposition / hardware-rendered content. Requires
 	// Windows 10 1803 or newer.
 	CaptureGPU(handle uintptr, options *CaptureOptions) (*ScreenshotBuffer, error)
+
+	// NewGPUSession opens a reusable Windows.Graphics.Capture session for a
+	// window. The expensive Direct3D device, frame pool, and capture session are
+	// created once; each Capture() call then grabs the latest composited frame.
+	// This makes a burst of GPU captures far cheaper than repeated CaptureGPU
+	// calls, which rebuild the whole pipeline every frame. Close() releases the
+	// GPU resources. All three methods must be called from the same goroutine.
+	NewGPUSession(handle uintptr, options *CaptureOptions) (GPUCaptureSession, error)
+}
+
+// GPUCaptureSession is a reusable Windows.Graphics.Capture pipeline bound to one
+// window. See ScreenshotEngine.NewGPUSession.
+type GPUCaptureSession interface {
+	// Capture grabs the latest composited frame as a BGRA32 buffer.
+	Capture() (*ScreenshotBuffer, error)
+	// Close releases the GPU resources and unlocks the capture thread.
+	Close() error
 }
 
 // WindowManager defines window management operations
 type WindowManager interface {
 	// Enumerate all windows with optional filtering
 	EnumerateWindows(filter *WindowFilter) ([]WindowInfo, error)
-	
+
 	// Get window information by handle
 	GetWindowInfo(handle uintptr) (*WindowInfo, error)
-	
+
 	// Set window position and size
 	SetWindowPos(handle uintptr, rect Rectangle) error
-	
+
 	// Show/hide window
 	SetWindowVisible(handle uintptr, visible bool) error
-	
+
 	// Minimize/restore window
 	SetWindowState(handle uintptr, state string) error
-	
+
 	// Bring window to foreground
 	BringToForeground(handle uintptr) error
 }
@@ -231,13 +251,13 @@ type WindowManager interface {
 type ChromeManager interface {
 	// Discover Chrome instances
 	DiscoverInstances() ([]ChromeInstance, error)
-	
+
 	// Get tabs for a specific Chrome instance
 	GetTabs(instance *ChromeInstance) ([]ChromeTab, error)
-	
+
 	// Capture screenshot of a tab
 	CaptureTab(tab *ChromeTab, options *CaptureOptions) (*ScreenshotBuffer, error)
-	
+
 	// Execute JavaScript in tab context
 	ExecuteScript(tab *ChromeTab, script string) (interface{}, error)
 }
@@ -246,16 +266,16 @@ type ChromeManager interface {
 type ImageProcessor interface {
 	// Encode buffer to specific format
 	Encode(buffer *ScreenshotBuffer, format ImageFormat, quality int) ([]byte, error)
-	
+
 	// Decode image data to buffer
 	Decode(data []byte) (*ScreenshotBuffer, error)
-	
+
 	// Resize image
 	Resize(buffer *ScreenshotBuffer, width, height int) (*ScreenshotBuffer, error)
-	
+
 	// Crop image
 	Crop(buffer *ScreenshotBuffer, rect Rectangle) (*ScreenshotBuffer, error)
-	
+
 	// Convert to Go image.Image
 	ToImage(buffer *ScreenshotBuffer) (image.Image, error)
 }
@@ -264,13 +284,13 @@ type ImageProcessor interface {
 type StreamManager interface {
 	// Start streaming session
 	StartSession(windowID uintptr, options *StreamOptions) (*StreamSession, error)
-	
+
 	// Stop streaming session
 	StopSession(sessionID string) error
-	
+
 	// Get active sessions
 	GetActiveSessions() ([]*StreamSession, error)
-	
+
 	// Update session parameters
 	UpdateSession(sessionID string, options *StreamOptions) error
 }
@@ -281,96 +301,96 @@ type StreamManager interface {
 type CaptureMethod string
 
 const (
-	CaptureAuto        CaptureMethod = "auto"        // Automatically select best method
-	CaptureBitBlt      CaptureMethod = "bitblt"       // Standard BitBlt (visible windows only)
-	CapturePrintWindow CaptureMethod = "printwindow"  // PrintWindow API
-	CaptureDWMThumbnail CaptureMethod = "dwmthumbnail" // DWM Thumbnail (universal)
-	CaptureWMPrint     CaptureMethod = "wmprint"      // WM_PRINT message
-	CaptureStealthRestore CaptureMethod = "stealth"   // Temporarily restore minimized windows
-	CaptureProcessMemory CaptureMethod = "memory"     // Direct process memory access
+	CaptureAuto           CaptureMethod = "auto"         // Automatically select best method
+	CaptureBitBlt         CaptureMethod = "bitblt"       // Standard BitBlt (visible windows only)
+	CapturePrintWindow    CaptureMethod = "printwindow"  // PrintWindow API
+	CaptureDWMThumbnail   CaptureMethod = "dwmthumbnail" // DWM Thumbnail (universal)
+	CaptureWMPrint        CaptureMethod = "wmprint"      // WM_PRINT message
+	CaptureStealthRestore CaptureMethod = "stealth"      // Temporarily restore minimized windows
+	CaptureProcessMemory  CaptureMethod = "memory"       // Direct process memory access
 )
 
 // CaptureOptions defines options for screenshot capture
 type CaptureOptions struct {
-	IncludeCursor    bool          `json:"include_cursor"`
-	IncludeFrame     bool          `json:"include_frame"`
-	Region           *Rectangle    `json:"region"`
-	ScaleFactor      float64       `json:"scale_factor"`
-	
+	IncludeCursor bool       `json:"include_cursor"`
+	IncludeFrame  bool       `json:"include_frame"`
+	Region        *Rectangle `json:"region"`
+	ScaleFactor   float64    `json:"scale_factor"`
+
 	// Visibility options
-	AllowMinimized   bool          `json:"allow_minimized"`   // Allow capturing minimized windows
-	AllowHidden      bool          `json:"allow_hidden"`      // Allow capturing hidden windows
-	AllowTrayApps    bool          `json:"allow_tray_apps"`   // Allow capturing system tray applications
-	AllowCloaked     bool          `json:"allow_cloaked"`     // Allow capturing cloaked windows (UWP apps)
-	
+	AllowMinimized bool `json:"allow_minimized"` // Allow capturing minimized windows
+	AllowHidden    bool `json:"allow_hidden"`    // Allow capturing hidden windows
+	AllowTrayApps  bool `json:"allow_tray_apps"` // Allow capturing system tray applications
+	AllowCloaked   bool `json:"allow_cloaked"`   // Allow capturing cloaked windows (UWP apps)
+
 	// Restoration options
-	RestoreWindow    bool          `json:"restore_window"`    // Temporarily restore minimized windows
-	StealthRestore   bool          `json:"stealth_restore"`   // Restore without activating/focusing
-	WaitForVisible   time.Duration `json:"wait_for_visible"`  // Wait time after restore
-	
+	RestoreWindow  bool          `json:"restore_window"`   // Temporarily restore minimized windows
+	StealthRestore bool          `json:"stealth_restore"`  // Restore without activating/focusing
+	WaitForVisible time.Duration `json:"wait_for_visible"` // Wait time after restore
+
 	// Advanced options
-	PreferredMethod  CaptureMethod `json:"preferred_method"`  // Preferred capture method
+	PreferredMethod  CaptureMethod `json:"preferred_method"`   // Preferred capture method
 	UseDWMThumbnails bool          `json:"use_dwm_thumbnails"` // Force use of DWM thumbnails
-	ForceRender      bool          `json:"force_render"`      // Force window to render before capture
-	DetectTrayApps   bool          `json:"detect_tray_apps"`  // Automatically detect tray applications
-	
+	ForceRender      bool          `json:"force_render"`       // Force window to render before capture
+	DetectTrayApps   bool          `json:"detect_tray_apps"`   // Automatically detect tray applications
+
 	// Fallback options
-	RetryCount       int           `json:"retry_count"`       // Number of retry attempts
-	FallbackMethods  []CaptureMethod `json:"fallback_methods"` // Methods to try if preferred fails
-	
+	RetryCount      int             `json:"retry_count"`      // Number of retry attempts
+	FallbackMethods []CaptureMethod `json:"fallback_methods"` // Methods to try if preferred fails
+
 	CustomProperties map[string]string `json:"custom_properties"`
 }
 
 // WindowFilter defines filtering options for window enumeration
 type WindowFilter struct {
-	TitleContains  string   `json:"title_contains"`
-	ClassNames     []string `json:"class_names"`
-	ProcessIDs     []uint32 `json:"process_ids"`
-	VisibleOnly    bool     `json:"visible_only"`
-	MinimumSize    *Size    `json:"minimum_size"`
-	MaximumSize    *Size    `json:"maximum_size"`
-	ExcludeSystem  bool     `json:"exclude_system"`
+	TitleContains string   `json:"title_contains"`
+	ClassNames    []string `json:"class_names"`
+	ProcessIDs    []uint32 `json:"process_ids"`
+	VisibleOnly   bool     `json:"visible_only"`
+	MinimumSize   *Size    `json:"minimum_size"`
+	MaximumSize   *Size    `json:"maximum_size"`
+	ExcludeSystem bool     `json:"exclude_system"`
 }
 
 // StreamOptions defines options for streaming
 type StreamOptions struct {
-	FPS            int         `json:"fps"`
-	Quality        int         `json:"quality"`
-	Format         ImageFormat `json:"format"`
-	MaxWidth       int         `json:"max_width"`
-	MaxHeight      int         `json:"max_height"`
-	BufferSize     int         `json:"buffer_size"`
-	CompressionLevel int       `json:"compression_level"`
+	FPS              int         `json:"fps"`
+	Quality          int         `json:"quality"`
+	Format           ImageFormat `json:"format"`
+	MaxWidth         int         `json:"max_width"`
+	MaxHeight        int         `json:"max_height"`
+	BufferSize       int         `json:"buffer_size"`
+	CompressionLevel int         `json:"compression_level"`
 }
 
 // DefaultCaptureOptions returns sensible defaults for screenshot capture
 func DefaultCaptureOptions() *CaptureOptions {
 	return &CaptureOptions{
-		IncludeCursor:    false,
-		IncludeFrame:     true,
-		ScaleFactor:      1.0,
-		
+		IncludeCursor: false,
+		IncludeFrame:  true,
+		ScaleFactor:   1.0,
+
 		// Visibility options
-		AllowMinimized:   true,
-		AllowHidden:      true,
-		AllowTrayApps:    true,
-		AllowCloaked:     true,
-		
+		AllowMinimized: true,
+		AllowHidden:    true,
+		AllowTrayApps:  true,
+		AllowCloaked:   true,
+
 		// Restoration options
-		RestoreWindow:    false,
-		StealthRestore:   true,
-		WaitForVisible:   time.Second * 2,
-		
+		RestoreWindow:  false,
+		StealthRestore: true,
+		WaitForVisible: time.Second * 2,
+
 		// Advanced options
 		PreferredMethod:  CaptureAuto,
 		UseDWMThumbnails: false,
 		ForceRender:      false,
 		DetectTrayApps:   true,
-		
+
 		// Fallback options
-		RetryCount:       3,
-		FallbackMethods:  []CaptureMethod{CaptureDWMThumbnail, CapturePrintWindow, CaptureWMPrint, CaptureStealthRestore},
-		
+		RetryCount:      3,
+		FallbackMethods: []CaptureMethod{CaptureDWMThumbnail, CapturePrintWindow, CaptureWMPrint, CaptureStealthRestore},
+
 		CustomProperties: make(map[string]string),
 	}
 }
@@ -415,11 +435,11 @@ func (r Rectangle) Intersect(other Rectangle) Rectangle {
 	y1 := max(r.Y, other.Y)
 	x2 := min(r.X+r.Width, other.X+other.Width)
 	y2 := min(r.Y+r.Height, other.Y+other.Height)
-	
+
 	if x2 <= x1 || y2 <= y1 {
 		return Rectangle{} // No intersection
 	}
-	
+
 	return Rectangle{
 		X:      x1,
 		Y:      y1,
@@ -434,7 +454,7 @@ func (r Rectangle) Union(other Rectangle) Rectangle {
 	y1 := min(r.Y, other.Y)
 	x2 := max(r.X+r.Width, other.X+other.Width)
 	y2 := max(r.Y+r.Height, other.Y+other.Height)
-	
+
 	return Rectangle{
 		X:      x1,
 		Y:      y1,

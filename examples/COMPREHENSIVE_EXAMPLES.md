@@ -117,6 +117,55 @@ walkthrough, and the "How hidden-window capture works" section of
 Tab capture works for background tabs too, since it renders via Chrome DevTools.
 More detail: [chrome/chrome-tabs.md](chrome/chrome-tabs.md).
 
+### 6. Capture a burst of frames over time
+
+`capture_burst` grabs several frames of one window and returns each as its own image —
+handy for watching something change (animations, progress, flicker). Target it by
+`title` or `handle`; `interval_ms` is the throttle (minimum 100ms) and `count` is how
+many frames. Total time (`interval_ms × count`) is capped at 30s.
+
+```json
+{ "name": "capture_burst", "arguments": { "title": "Calculator", "count": 4, "interval_ms": 250 } }
+```
+
+Burst defaults to `jpeg` (not `png`) to keep the multi-image payload small. The window
+is resolved once, frames are paced on a fixed schedule, and each frame is encoded
+concurrently with the wait before the next capture. With `gpu: true` the burst reuses a
+single GPU capture session across all frames. Full reference:
+[../docs/MCP_TOOLS.md](../docs/MCP_TOOLS.md#capture_burst).
+
+### 7. Shrink the payload: format, region, and downscale
+
+Three knobs (all optional, all composable) control how much data comes back — the main
+lever for keeping an agent fast:
+
+**Auto format.** Omit `format` and the server samples the image: flat UI → PNG, photo /
+video → JPEG. Pass `format` to force it.
+
+```json
+{ "name": "capture_window_by_title", "arguments": { "title": "Notepad" } }
+```
+
+**Region.** Keep only a sub-rectangle, given as `[x, y, width, height]` in capture
+pixels — send an agent just the panel it needs.
+
+```json
+{ "name": "capture_window_by_title", "arguments": { "title": "Photoshop", "region": [700, 350, 500, 360] } }
+```
+
+**Downscale.** `max_width` caps the width (preserving aspect ratio) and `scale` is a
+`0`–`1` multiplier; if both are set the smaller result wins, and the image is never
+upscaled. A half-scale JPEG is on the order of ~20× smaller than a full-resolution PNG.
+
+```json
+{ "name": "capture_full_screen",     "arguments": { "monitor": 0, "max_width": 1280 } }
+{ "name": "capture_window_by_title", "arguments": { "title": "Notepad", "format": "jpeg", "scale": 0.5 } }
+```
+
+They compose: `region` crops first, then the downscale shrinks the crop. The summary
+notes the result (e.g. `500x360 (from 1936x1096 capture)`). Full reference:
+[../docs/MCP_TOOLS.md](../docs/MCP_TOOLS.md#region-capture).
+
 ---
 
 ## Part 2 — REST + WebSocket server

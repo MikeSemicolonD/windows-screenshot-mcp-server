@@ -174,7 +174,49 @@ no HTTP port is involved.
 | `find_hidden_windows` | Enumerate hidden top-level windows. |
 | `enumerate_process_windows` | List all windows owned by a process, including hidden/cloaked. |
 
-All capture tools accept `format` (`png` default, or `jpeg`) and `quality` (1-100).
+All capture tools accept `format` (`png`, `jpeg`, or omitted to auto-pick — see
+[Format selection](#format-selection)), `quality` (1-100), an optional `region` crop
+(see [Region capture](#region-capture)), and the `max_width` / `scale` downscale
+options (see [Downscaling](#downscaling-max_width--scale)).
+
+#### Format selection
+
+If you omit `format`, the server **auto-picks** the codec by sampling the image: flat
+UI / text content (large areas of repeated colour) is encoded as **PNG** for crisp,
+lossless output, while photographic or video content (mostly unique colours) is encoded
+as **JPEG**, which is far smaller and faster for that kind of image. Pass `format`
+explicitly to override. (`capture_burst` defaults to JPEG instead, to keep its
+multi-image payload small.)
+
+#### Region capture
+
+Every capture tool accepts an optional `region` — `[x, y, width, height]` in pixels
+relative to the top-left of the capture. Only that sub-rectangle is kept. The crop
+happens before any downscale, so it reduces the payload further and is the way to send
+an agent just the part of a window it needs rather than the whole frame. The summary
+text reports the final dimensions and the original capture size.
+
+```jsonc
+// just a 500x360 panel of the window, as a downscaled image
+{ "name": "capture_window_by_title",
+  "arguments": { "title": "Photoshop", "region": [700, 350, 500, 360], "scale": 0.5 } }
+```
+
+#### Downscaling (`max_width` / `scale`)
+
+Every capture tool (including `capture_burst`) accepts two optional downscale
+arguments. Downscaling cuts both the encode time and the payload size roughly with the
+square of the scale factor, so it is the **highest-leverage option for agents** that
+only need to *see* a window rather than read fine text at full resolution.
+
+- `max_width` — downscale so the image is at most this many pixels wide, preserving
+  aspect ratio (e.g. `1280`). `0` or omitted means full resolution.
+- `scale` — a downscale factor between `0` and `1` (e.g. `0.5` = half width and height).
+
+If both are given, the smaller result wins. The image is **never upscaled**. When a
+capture is downscaled, the summary text notes it (e.g. `968x548 (downscaled from
+1936x1096)`). As a rough guide, a half-scale JPEG is on the order of ~20× smaller than
+a full-resolution PNG of the same window.
 
 #### Title matching (`capture_window_by_title`)
 
@@ -216,7 +258,8 @@ Unlike the single-frame tools, burst **defaults to JPEG at quality 80** to keep 
 multi-image payload small; pass `format=png` for lossless frames. Frames are paced
 against an absolute schedule so capture/encode time does not drift the cadence, and a
 per-frame failure is reported in the summary rather than aborting the whole burst.
-Optional `gpu=true` is supported but re-initializes per frame and is slower for bursts.
+Optional `gpu=true` reuses a single GPU capture session across all frames, so it stays
+efficient across the burst — enable it when you need DirectComposition / hardware-rendered content.
 
 > **Payload size:** many full-resolution frames in one response is heavy even as JPEG.
 > The 30 s cap and minimum interval bound it, but for high frame counts consider a
