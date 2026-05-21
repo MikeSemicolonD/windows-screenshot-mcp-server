@@ -166,6 +166,7 @@ no HTTP port is involved.
 | `capture_window_by_pid` | Capture the main window of a process; `hidden=true` uses DWM/PrintWindow fallbacks. |
 | `capture_window_by_handle` | Capture a window by its `HWND`. |
 | `capture_window_by_class` | Capture a window by its class name. |
+| `capture_burst` | Capture a throttled series of frames of one window over time (see below). |
 | `capture_full_screen` | Capture a single monitor by index (`0` = primary). |
 | `list_chrome_tabs` | List open tabs across all detected Chrome instances. |
 | `capture_chrome_tab` | Capture a specific Chrome tab by ID. |
@@ -191,6 +192,35 @@ Two independent flags tighten the match:
 
 They combine freely (e.g. `exact=true, case_sensitive=false` is a full-title match
 that ignores case).
+
+#### Burst capture (`capture_burst`)
+
+Captures a rapid series of screenshots of a single window over time and returns
+**every frame as a separate image**, which is useful for watching a window change
+(animations, progress bars, flicker, intermittent rendering).
+
+Target the window with **either** `title` (case-insensitive substring, same matching
+as `capture_window_by_title`) **or** `handle` (`HWND`). The window is resolved once up
+front, so each frame costs only a capture + encode.
+
+Throttle and frame count:
+
+- `interval_ms` — spacing between frames. Default `500`; a **minimum of 100 ms is
+  enforced** so the target window is not hammered.
+- `count` — number of frames. Default `5`.
+- Total capture time is `interval_ms × count` and is **capped at 30 seconds**. If the
+  request exceeds that, `count` is reduced to fit and the result text notes the
+  adjustment.
+
+Unlike the single-frame tools, burst **defaults to JPEG at quality 80** to keep the
+multi-image payload small; pass `format=png` for lossless frames. Frames are paced
+against an absolute schedule so capture/encode time does not drift the cadence, and a
+per-frame failure is reported in the summary rather than aborting the whole burst.
+Optional `gpu=true` is supported but re-initializes per frame and is slower for bursts.
+
+> **Payload size:** many full-resolution frames in one response is heavy even as JPEG.
+> The 30 s cap and minimum interval bound it, but for high frame counts consider a
+> lower `quality` or fewer frames.
 
 #### Monitor selection (`capture_full_screen`)
 

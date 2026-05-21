@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -74,6 +75,18 @@ func registerTools(s *server.MCPServer) {
 		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100")),
 		mcp.WithBoolean("gpu", mcp.Description("Use the GPU-accelerated Windows.Graphics.Capture path instead of PrintWindow/BitBlt. Reliably reproduces DirectComposition / hardware-rendered content. Requires Windows 10 1803+.")),
 	), captureByHandle)
+
+	s.AddTool(mcp.NewTool("capture_burst",
+		mcp.WithDescription("Capture a rapid series of screenshots of one window over time, returning every frame as a separate image. Useful for watching a window change (animations, progress, flicker). Target the window with either title (case-insensitive substring, same matching as capture_window_by_title) or handle (HWND). Throttling: interval_ms is the spacing between frames (minimum 100ms is enforced so the target is not hammered) and count is how many frames to take. Total capture time is interval_ms*count and is capped at 30 seconds — if the request exceeds that, count is reduced and the result text notes the adjustment. Defaults to JPEG to keep the multi-image payload small; pass format=png for lossless frames."),
+		mcp.WithString("title", mcp.Description("Window title to match (case-insensitive substring). Provide this or handle.")),
+		mcp.WithNumber("handle", mcp.Description("Window handle (HWND) as integer. Provide this or title.")),
+		mcp.WithNumber("count", mcp.Description("Number of frames to capture (default 5). Combined with interval_ms it is capped so total time stays within 30s.")),
+		mcp.WithNumber("interval_ms", mcp.Description("Milliseconds between frames (default 500, minimum 100). Acts as the throttle so captures are not taken too fast.")),
+		mcp.WithString("format", mcp.Description("png or jpeg (default jpeg for burst, to keep the payload small)")),
+		mcp.WithNumber("quality", mcp.Description("JPEG quality 1-100 (default 80)")),
+		mcp.WithBoolean("include_cursor", mcp.Description("Include the mouse cursor in each frame")),
+		mcp.WithBoolean("gpu", mcp.Description("Use the GPU-accelerated Windows.Graphics.Capture path. Note: this re-initializes per frame and is slower for bursts; prefer leaving it off unless you need DirectComposition content.")),
+	), captureBurst)
 
 	s.AddTool(mcp.NewTool("capture_window_by_class",
 		mcp.WithDescription("Capture a screenshot of a window by its class name."),
@@ -301,6 +314,131 @@ func captureByHandle(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolR
 	}
 	format, quality := captureFormat(args)
 	return imageResult(buf, label, format, quality)
+}
+
+const (
+	burstMaxTotal    = 30 * time.Second
+	burstMinInterval = 100 * time.Millisecond
+)
+
+func captureBurst(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	// Resolve the target window once up front so we don't re-enumerate windows
+	// on every frame — that keeps the per-frame cost to just capture + encode.
+	title := argString(args, "title", "")
+	handle := uintptr(argInt64(args, "handle", 0))
+	if title == "" && handle == 0 {
+		return mcp.NewToolResultError("provide either title or handle"), nil
+	}
+	var targetLabel string
+	if handle == 0 {
+		matches, err := engine.FindWindowsByTitle(title, false, false)
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("window search failed", err), nil
+		}
+		if len(matches) == 0 {
+			return mcp.NewToolResultError(fmt.Sprintf("no top-level window title matched %q", title)), nil
+		}
+		handle = matches[0].Handle
+		targetLabel = fmt.Sprintf("window %q", matches[0].Title)
+	} else {
+		targetLabel = fmt.Sprintf("hwnd 0x%x", handle)
+	}
+
+	// Throttle and frame count, capped so total capture time stays within 30s.
+	interval := time.Duration(argInt64(args, "interval_ms", 500)) * time.Millisecond
+	if interval < burstMinInterval {
+		interval = burstMinInterval
+	}
+	count := int(argInt64(args, "count", 5))
+	if count < 1 {
+		count = 1
+	}
+	var noteAdjusted string
+	if maxCount := int(burstMaxTotal / interval); maxCount >= 1 && count > maxCount {
+		noteAdjusted = fmt.Sprintf(" (reduced from %d to fit the 30s cap)", count)
+		count = maxCount
+	}
+
+	// Burst defaults to JPEG q80 to keep the multi-image payload manageable.
+	format := types.FormatJPEG
+	mime := "image/jpeg"
+	if strings.EqualFold(argString(args, "format", "jpeg"), "png") {
+		format = types.FormatPNG
+		mime = "image/png"
+	}
+	quality := int(argInt64(args, "quality", 80))
+
+	opts := defaultOptions()
+	opts.IncludeCursor = argBool(args, "include_cursor", false)
+	useGPU := argBool(args, "gpu", false)
+
+	contents := make([]mcp.Content, 0, count+1)
+	var (
+		captured   int
+		totalBytes int
+		failures   []string
+	)
+	start := time.Now()
+	for i := 0; i < count; i++ {
+		// Pace frames against an absolute schedule so capture/encode time does
+		// not let the cadence drift. The first frame is taken immediately.
+		if i > 0 {
+			if d := time.Until(start.Add(time.Duration(i) * interval)); d > 0 {
+				timer := time.NewTimer(d)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					failures = append(failures, "cancelled before all frames were captured")
+					goto done
+				case <-timer.C:
+				}
+			}
+		}
+
+		var (
+			buf *types.ScreenshotBuffer
+			err error
+		)
+		if useGPU {
+			buf, err = engine.CaptureGPU(handle, opts)
+		} else {
+			buf, err = engine.CaptureByHandle(handle, opts)
+		}
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("frame %d: %v", i+1, err))
+			continue
+		}
+		encoded, err := imgProc.Encode(buf, format, quality)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("frame %d encode: %v", i+1, err))
+			continue
+		}
+		contents = append(contents, mcp.NewImageContent(base64.StdEncoding.EncodeToString(encoded), mime))
+		captured++
+		totalBytes += len(encoded)
+	}
+done:
+
+	if captured == 0 {
+		msg := "burst captured no frames"
+		if len(failures) > 0 {
+			msg += ": " + strings.Join(failures, "; ")
+		}
+		return mcp.NewToolResultError(msg), nil
+	}
+
+	summary := fmt.Sprintf("Burst of %s — %d frame(s)%s over %s, ~%dms apart, %d bytes total (%s)",
+		targetLabel, captured, noteAdjusted, time.Since(start).Round(time.Millisecond),
+		interval.Milliseconds(), totalBytes, mime)
+	if len(failures) > 0 {
+		summary += fmt.Sprintf(" — %d issue(s): %s", len(failures), strings.Join(failures, "; "))
+	}
+
+	return &mcp.CallToolResult{
+		Content: append([]mcp.Content{mcp.NewTextContent(summary)}, contents...),
+	}, nil
 }
 
 func captureByClass(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

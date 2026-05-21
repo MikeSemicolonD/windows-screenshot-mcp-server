@@ -17,6 +17,12 @@ import (
 	"github.com/screenshot-mcp-server/pkg/types"
 )
 
+// pngEncoder is shared across all PNG encodes. BestSpeed trades a modest
+// increase in file size (~10-20%) for a 2-4x faster encode, which dominates
+// capture latency for large frames. The default level is far slower and the
+// extra compression rarely matters for screenshots streamed over MCP.
+var pngEncoder = png.Encoder{CompressionLevel: png.BestSpeed}
+
 // ImageProcessor implements image processing and encoding operations
 type ImageProcessor struct {
 	defaultQuality int
@@ -52,7 +58,7 @@ func (p *ImageProcessor) Encode(buffer *types.ScreenshotBuffer, format types.Ima
 	var buf bytes.Buffer
 	switch format {
 	case types.FormatPNG:
-		err = png.Encode(&buf, img)
+		err = pngEncoder.Encode(&buf, img)
 	case types.FormatJPEG:
 		if quality <= 0 || quality > 100 {
 			quality = p.defaultQuality
@@ -61,7 +67,7 @@ func (p *ImageProcessor) Encode(buffer *types.ScreenshotBuffer, format types.Ima
 	case types.FormatBMP:
 		// For BMP, we'll use PNG as fallback since Go doesn't have native BMP support
 		// In a production system, you might want to add a BMP encoder library
-		err = png.Encode(&buf, img)
+		err = pngEncoder.Encode(&buf, img)
 	default:
 		return nil, fmt.Errorf("unsupported format: %s", format)
 	}
@@ -260,18 +266,26 @@ func (p *ImageProcessor) ToImage(buffer *types.ScreenshotBuffer) (image.Image, e
 func (p *ImageProcessor) bgraToRGBA(buffer *types.ScreenshotBuffer) image.Image {
 	// Create new RGBA image
 	rgba := image.NewRGBA(image.Rect(0, 0, buffer.Width, buffer.Height))
-	
-	// Convert BGRA to RGBA
-	for i := 0; i < len(buffer.Data); i += 4 {
-		if i+3 < len(buffer.Data) {
-			// BGRA -> RGBA: swap B and R channels
-			rgba.Pix[i] = buffer.Data[i+2]   // R = B
-			rgba.Pix[i+1] = buffer.Data[i+1] // G = G
-			rgba.Pix[i+2] = buffer.Data[i]   // B = R
-			rgba.Pix[i+3] = buffer.Data[i+3] // A = A
-		}
+
+	// Convert BGRA -> RGBA: swap the B and R channels. We slice both buffers to
+	// the same 4-pixel-aligned length up front so the inner loop carries no
+	// per-iteration bounds check (the previous code re-checked i+3 every step).
+	src := buffer.Data
+	dst := rgba.Pix
+	n := len(src)
+	if len(dst) < n {
+		n = len(dst)
 	}
-	
+	n -= n % 4
+	src = src[:n]
+	dst = dst[:n]
+	for i := 0; i < n; i += 4 {
+		dst[i] = src[i+2]   // R = B
+		dst[i+1] = src[i+1] // G = G
+		dst[i+2] = src[i]   // B = R
+		dst[i+3] = src[i+3] // A = A
+	}
+
 	return rgba
 }
 
