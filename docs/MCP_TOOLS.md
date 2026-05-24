@@ -39,6 +39,12 @@ Build the binary first: `go build -o screenshot-mcp.exe ./cmd/mcp`
   DWM-thumbnail and `PrintWindow` fallbacks.
 - A missing required argument, a window/tab that cannot be found, or a capture failure
   is returned as an MCP tool error (not a thrown exception).
+- **Reliability.** Captures are bounded by a watchdog timeout, so a window that hangs or
+  is closed mid-capture returns an error instead of freezing the tool. When the target
+  window has gone, the error says so explicitly (e.g. *"the target window … was closed
+  during the capture"*). `capture_burst` additionally checks between frames: if the
+  window is closed it stops immediately and returns the frames captured so far with a
+  note, rather than timing out on every remaining frame.
 
 ---
 
@@ -162,7 +168,10 @@ Total capture time is `interval_ms × count` and is **capped at 30 seconds** —
 request exceeds that, `count` is reduced to fit and the summary notes the adjustment.
 Frames are paced against an absolute schedule so encode time does not drift the cadence,
 and each frame's encode runs concurrently with the wait before the next capture. A
-per-frame failure is reported in the summary rather than aborting the whole burst.
+per-frame failure is reported in the summary rather than aborting the whole burst —
+*except* when the target window has been closed (or stops responding for several frames
+in a row), in which case the burst stops early and returns the frames it already has
+with a note explaining why, instead of timing out on every remaining frame.
 
 The result is a text summary followed by one image content block per captured frame, in
 capture order.

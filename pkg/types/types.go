@@ -208,6 +208,11 @@ type ScreenshotEngine interface {
 	// Windows 10 1803 or newer.
 	CaptureGPU(handle uintptr, options *CaptureOptions) (*ScreenshotBuffer, error)
 
+	// WindowExists reports whether a handle still refers to a live window. It is
+	// a cheap, non-blocking check used to fail fast or abort a burst when the
+	// target window has closed.
+	WindowExists(handle uintptr) bool
+
 	// NewGPUSession opens a reusable Windows.Graphics.Capture session for a
 	// window. The expensive Direct3D device, frame pool, and capture session are
 	// created once; each Capture() call then grabs the latest composited frame.

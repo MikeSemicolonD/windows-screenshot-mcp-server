@@ -283,6 +283,64 @@ func defaultOptions() *types.CaptureOptions {
 	return opts
 }
 
+const (
+	// captureTimeout bounds a single capture. PrintWindow / BitBlt are dispatched
+	// to the target window's UI thread and block indefinitely if that thread is
+	// hung or the window is mid-teardown; the watchdog turns that freeze into a
+	// recoverable error.
+	captureTimeout = 10 * time.Second
+	// burstFrameTimeout bounds each frame of a burst (shorter, so a stuck window
+	// is noticed quickly and the burst can abort rather than hang per frame).
+	burstFrameTimeout = 6 * time.Second
+	// burstAbortAfter stops a burst once this many consecutive frames fail, so a
+	// window that closes mid-burst yields one quick error instead of N timeouts.
+	burstAbortAfter = 3
+)
+
+// captureWithTimeout runs a blocking capture under a deadline. If the capture
+// overruns, it returns a timeout error and abandons the work in its goroutine —
+// the underlying syscall cannot be cancelled, but the tool stays responsive
+// instead of freezing. A panic in the capture is recovered into an error so a
+// bad handle can never crash the server. The channel is buffered so the
+// abandoned goroutine can still send (and exit) once the syscall returns.
+func captureWithTimeout(d time.Duration, fn func() (*types.ScreenshotBuffer, error)) (*types.ScreenshotBuffer, error) {
+	type result struct {
+		buf *types.ScreenshotBuffer
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ch <- result{nil, fmt.Errorf("capture panicked: %v", r)}
+			}
+		}()
+		buf, err := fn()
+		ch <- result{buf, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.buf, r.err
+	case <-time.After(d):
+		return nil, fmt.Errorf("capture timed out after %s — the target window is unresponsive or closing", d)
+	}
+}
+
+// guardCapture wraps a single capture with the standard watchdog timeout.
+func guardCapture(fn func() (*types.ScreenshotBuffer, error)) (*types.ScreenshotBuffer, error) {
+	return captureWithTimeout(captureTimeout, fn)
+}
+
+// captureErr turns a capture failure into an MCP error, distinguishing the
+// common case where the window was closed mid-capture (so the message is
+// actionable) from other failures. handle may be 0 when it is not known.
+func captureErr(handle uintptr, err error) *mcp.CallToolResult {
+	if handle != 0 && !engine.WindowExists(handle) {
+		return mcp.NewToolResultError(fmt.Sprintf("the target window (hwnd 0x%x) was closed during the capture", handle))
+	}
+	return mcp.NewToolResultErrorFromErr("capture failed", err)
+}
+
 // --- tool handlers ---
 
 // titleMatchDesc describes a title match mode in plain words, e.g.
@@ -325,12 +383,12 @@ func captureByTitle(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	useGPU := argBool(args, "gpu", false)
 	var buf *types.ScreenshotBuffer
 	if useGPU {
-		buf, err = engine.CaptureGPU(target.Handle, opts)
+		buf, err = guardCapture(func() (*types.ScreenshotBuffer, error) { return engine.CaptureGPU(target.Handle, opts) })
 	} else {
-		buf, err = engine.CaptureByHandle(target.Handle, opts)
+		buf, err = guardCapture(func() (*types.ScreenshotBuffer, error) { return engine.CaptureByHandle(target.Handle, opts) })
 	}
 	if err != nil {
-		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
+		return captureErr(target.Handle, err), nil
 	}
 
 	label := fmt.Sprintf("window %q (%s for %q)", target.Title, mode, title)
@@ -367,9 +425,9 @@ func captureByPID(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 	var buf *types.ScreenshotBuffer
 	var err error
 	if argBool(args, "hidden", false) {
-		buf, err = engine.CaptureHiddenByPID(pid, opts)
+		buf, err = guardCapture(func() (*types.ScreenshotBuffer, error) { return engine.CaptureHiddenByPID(pid, opts) })
 	} else {
-		buf, err = engine.CaptureByPID(pid, opts)
+		buf, err = guardCapture(func() (*types.ScreenshotBuffer, error) { return engine.CaptureByPID(pid, opts) })
 	}
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
@@ -384,17 +442,21 @@ func captureByHandle(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolR
 	if handle == 0 {
 		return mcp.NewToolResultError("handle is required"), nil
 	}
+	if !engine.WindowExists(handle) {
+		return mcp.NewToolResultError(fmt.Sprintf("no live window with handle 0x%x (it may have been closed)", handle)), nil
+	}
+	opts := defaultOptions()
 	var buf *types.ScreenshotBuffer
 	var err error
 	label := fmt.Sprintf("hwnd 0x%x", handle)
 	if argBool(args, "gpu", false) {
-		buf, err = engine.CaptureGPU(handle, defaultOptions())
+		buf, err = guardCapture(func() (*types.ScreenshotBuffer, error) { return engine.CaptureGPU(handle, opts) })
 		label += " [GPU]"
 	} else {
-		buf, err = engine.CaptureByHandle(handle, defaultOptions())
+		buf, err = guardCapture(func() (*types.ScreenshotBuffer, error) { return engine.CaptureByHandle(handle, opts) })
 	}
 	if err != nil {
-		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
+		return captureErr(handle, err), nil
 	}
 	out := outputFromArgs(args, types.FormatAuto)
 	return imageResult(buf, label, out)
@@ -428,6 +490,9 @@ func captureBurst(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 		targetLabel = fmt.Sprintf("window %q", matches[0].Title)
 	} else {
 		targetLabel = fmt.Sprintf("hwnd 0x%x", handle)
+	}
+	if !engine.WindowExists(handle) {
+		return mcp.NewToolResultError(fmt.Sprintf("no live window for %s (it may have been closed)", targetLabel)), nil
 	}
 
 	// Throttle and frame count, capped so total capture time stays within 30s.
@@ -491,6 +556,10 @@ func captureBurst(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 		mu.Unlock()
 	}
 
+	var (
+		consecutiveFails int
+		windowClosed     bool
+	)
 	start := time.Now()
 	for i := 0; i < count; i++ {
 		// Pace frames against an absolute schedule so capture/encode time does
@@ -513,14 +582,31 @@ func captureBurst(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 			err error
 		)
 		if useGPU {
+			// The GPU session is bound to this goroutine's locked OS thread, so it
+			// is captured inline; its frame wait is already internally bounded.
 			buf, err = gpuSess.Capture()
 		} else {
-			buf, err = engine.CaptureByHandle(handle, opts)
+			buf, err = captureWithTimeout(burstFrameTimeout, func() (*types.ScreenshotBuffer, error) {
+				return engine.CaptureByHandle(handle, opts)
+			})
 		}
 		if err != nil {
+			// If the window has gone, stop immediately with a clear reason rather
+			// than timing out on every remaining frame.
+			if !engine.WindowExists(handle) {
+				windowClosed = true
+				addFailure(fmt.Sprintf("frame %d: target window was closed", i+1))
+				goto done
+			}
 			addFailure(fmt.Sprintf("frame %d: %v", i+1, err))
+			consecutiveFails++
+			if consecutiveFails >= burstAbortAfter {
+				addFailure(fmt.Sprintf("aborted after %d consecutive failures (window unresponsive)", consecutiveFails))
+				goto done
+			}
 			continue
 		}
+		consecutiveFails = 0
 		if origW == 0 {
 			origW, origH = buf.Width, buf.Height
 		}
@@ -558,6 +644,9 @@ done:
 
 	if captured == 0 {
 		msg := "burst captured no frames"
+		if windowClosed {
+			msg = "burst captured no frames — the target window was closed before any frame was captured"
+		}
 		if len(failures) > 0 {
 			msg += ": " + strings.Join(failures, "; ")
 		}
@@ -566,11 +655,14 @@ done:
 
 	dims := fmt.Sprintf("%dx%d", finalW, finalH)
 	if finalW != origW || finalH != origH {
-		dims = fmt.Sprintf("%dx%d (downscaled from %dx%d)", finalW, finalH, origW, origH)
+		dims = fmt.Sprintf("%dx%d (from %dx%d capture)", finalW, finalH, origW, origH)
 	}
 	summary := fmt.Sprintf("Burst of %s — %d frame(s)%s at %s over %s, ~%dms apart, %d bytes total (%s)",
 		targetLabel, captured, noteAdjusted, dims, time.Since(start).Round(time.Millisecond),
 		interval.Milliseconds(), totalBytes, mime)
+	if windowClosed {
+		summary += fmt.Sprintf(" — stopped early: the target window was closed after %d frame(s)", captured)
+	}
 	if len(failures) > 0 {
 		summary += fmt.Sprintf(" — %d issue(s): %s", len(failures), strings.Join(failures, "; "))
 	}
@@ -586,7 +678,7 @@ func captureByClass(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	if class == "" {
 		return mcp.NewToolResultError("class_name is required"), nil
 	}
-	buf, err := engine.CaptureByClassName(class, defaultOptions())
+	buf, err := guardCapture(func() (*types.ScreenshotBuffer, error) { return engine.CaptureByClassName(class, defaultOptions()) })
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
 	}
@@ -597,7 +689,7 @@ func captureByClass(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 func captureFullScreen(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	monitor := int(argInt64(args, "monitor", 0))
-	buf, err := engine.CaptureFullScreen(monitor, defaultOptions())
+	buf, err := guardCapture(func() (*types.ScreenshotBuffer, error) { return engine.CaptureFullScreen(monitor, defaultOptions()) })
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
 	}
@@ -659,7 +751,9 @@ func captureChromeTab(_ context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 		return mcp.NewToolResultError(fmt.Sprintf("tab %q not found", tabID)), nil
 	}
 
-	buf, err := chromeMgr.CaptureTab(target, defaultOptions())
+	buf, err := captureWithTimeout(captureTimeout, func() (*types.ScreenshotBuffer, error) {
+		return chromeMgr.CaptureTab(target, defaultOptions())
+	})
 	if err != nil {
 		return mcp.NewToolResultErrorFromErr("capture failed", err), nil
 	}
