@@ -71,8 +71,10 @@ Capture a top-level window located by its title.
 with `case_sensitive=false` is a full-title match that ignores case.
 
 When several windows match, the best target is captured (visible and non-minimized
-first, then an exact title match, then the shortest/closest title). Any other matches
-are listed in the summary text with their HWNDs so you can re-target precisely.
+first, then an exact title match, then the shortest/closest title). Up to three other
+matches are listed in the summary text with their HWNDs so you can re-target precisely;
+when more than three also match, only the count is reported (narrow the title or set
+`exact=true` to disambiguate) to keep the summary readable.
 
 ```json
 { "name": "capture_window_by_title", "arguments": { "title": "Notepad" } }
@@ -241,12 +243,18 @@ frame — strictly less payload than capturing and downscaling the entire window
 Every capture tool (including `capture_burst`) accepts two optional downscale arguments:
 
 - **`max_width`** — downscale so the image is at most this many pixels wide, preserving
-  aspect ratio (e.g. `1280`). `0` or omitted means full resolution.
+  aspect ratio (e.g. `1280`). Pass `0` to force full resolution.
 - **`scale`** — a downscale factor between `0` and `1` (e.g. `0.5` = half width and
   height).
 
 If both are given, the smaller result wins, and the image is **never upscaled**. When a
-downscale is applied, the summary text appends `(downscaled from <W>x<H>)`.
+downscale (or region crop) changes the dimensions, the summary text appends
+`(from <W>x<H> capture)`.
+
+**Default cap.** Full-resolution images dominate the round-trip latency for an agent
+(transport + image tokens), so a capture with **no sizing at all** — no `max_width`,
+`scale`, or `region` — is capped to **1280px wide** by default. Pass `max_width: 0` to
+opt back into full resolution.
 
 Downscaling cuts both the encode time and the payload size roughly with the square of
 the scale factor, making it the **highest-leverage option for agents** that only need

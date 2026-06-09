@@ -384,7 +384,11 @@ func DefaultCaptureOptions() *CaptureOptions {
 		// Restoration options
 		RestoreWindow:  false,
 		StealthRestore: true,
-		WaitForVisible: time.Second * 2,
+		// Time to let a window repaint after a restore before capturing. Only
+		// applies on the minimized/hidden fallback paths (a normal visible
+		// capture never waits). 400ms is enough for almost all apps to paint;
+		// the previous 2s made those fallbacks feel like a multi-second hang.
+		WaitForVisible: time.Millisecond * 400,
 
 		// Advanced options
 		PreferredMethod:  CaptureAuto,

@@ -54,14 +54,14 @@ func main() {
 // see a window rather than read fine text at full resolution. The same two
 // params below are added to every capture tool.
 const (
-	maxWidthDesc = "Downscale so the image is at most this many pixels wide, preserving aspect ratio (e.g. 1280). 0 or omitted = full resolution. Smaller images encode faster and use far less payload."
+	maxWidthDesc = "Downscale so the image is at most this many pixels wide, preserving aspect ratio (e.g. 1280). Smaller images encode faster and use far less payload. If you give no sizing at all (no max_width/scale/region) a default 1280px cap is applied to keep the round-trip fast; pass max_width: 0 to force full resolution."
 	scaleDesc    = "Downscale factor between 0 and 1 (e.g. 0.5 = half width and height). If both scale and max_width are given, the smaller result wins. Never upscales."
 	regionDesc   = "Optional sub-rectangle to keep, as [x, y, width, height] in pixels relative to the top-left of the capture. Cropped before any downscale, cutting the payload further. Omit to keep the whole capture."
 )
 
 func registerTools(s *server.MCPServer) {
 	s.AddTool(mcp.NewTool("capture_window_by_title",
-		mcp.WithDescription("Capture a screenshot of a top-level window found by title. By default the title is matched case-insensitively as a substring (a \"lazy\" match): \"command\", \"prompt\", and \"Command Prompt\" all match a window titled \"Command Prompt\". When several windows match, the best target is captured (visible and non-minimized windows first, then an exact title match, then the shortest/closest title) and any other matches are listed in the result text so you can re-target. Two independent flags tighten the match: exact=true requires the title to equal the given string in full instead of just containing it; case_sensitive=true makes the comparison respect letter case. They combine freely (e.g. exact=true with case_sensitive=false is a full-title match ignoring case)."),
+		mcp.WithDescription("Capture a screenshot of a top-level window found by title. By default the title is matched case-insensitively as a substring (a \"lazy\" match): \"command\", \"prompt\", and \"Command Prompt\" all match a window titled \"Command Prompt\". When several windows match, the best target is captured (visible and non-minimized windows first, then an exact title match, then the shortest/closest title) and up to three other matches are listed in the result text so you can re-target (when more match, only the count is reported, so narrow the title or set exact=true to disambiguate). Two independent flags tighten the match: exact=true requires the title to equal the given string in full instead of just containing it; case_sensitive=true makes the comparison respect letter case. They combine freely (e.g. exact=true with case_sensitive=false is a full-title match ignoring case)."),
 		mcp.WithString("title", mcp.Required(), mcp.Description("Window title to match. By default this is a case-insensitive substring (lazy match); see the exact and case_sensitive flags to tighten it.")),
 		mcp.WithBoolean("exact", mcp.Description("Require the window title to equal the given string in full, instead of the default substring (contains) match. Default false.")),
 		mcp.WithBoolean("case_sensitive", mcp.Description("Make the title comparison respect letter case. Default false (case-insensitive).")),
@@ -201,18 +201,34 @@ type outputOpts struct {
 	scale    float64          // 0 = no scale factor
 }
 
+// defaultMaxWidth caps the width of a capture when the caller specifies no
+// sizing at all. Full-resolution images dominate the round-trip latency for an
+// agent (transport + image tokens), and 1280px is plenty to read most UIs.
+// Callers opt back into full resolution with max_width: 0.
+const defaultMaxWidth = 1280
+
 // outputFromArgs reads the shared output arguments. When format is omitted it
 // resolves to FormatAuto, letting the encoder pick PNG (flat UI) or JPEG
 // (photographic/video) by sampling the image. defaultFormat overrides that
 // fallback (burst passes JPEG to keep its multi-image payload small).
+//
+// If the caller gives no sizing (no max_width, scale, or region), a default
+// max_width cap is applied so payloads stay small by default; max_width: 0
+// explicitly requests full resolution.
 func outputFromArgs(args map[string]any, defaultFormat types.ImageFormat) outputOpts {
 	o := outputOpts{
-		quality:  int(argInt64(args, "quality", 90)),
-		maxWidth: int(argInt64(args, "max_width", 0)),
-		region:   regionFromArgs(args),
+		quality: int(argInt64(args, "quality", 90)),
+		region:  regionFromArgs(args),
 	}
 	if v, ok := args["scale"].(float64); ok {
 		o.scale = v
+	}
+	_, hasMaxWidth := args["max_width"]
+	switch {
+	case hasMaxWidth:
+		o.maxWidth = int(argInt64(args, "max_width", 0)) // honor explicitly, 0 = full res
+	case o.scale == 0 && o.region == nil:
+		o.maxWidth = defaultMaxWidth // no sizing given → sane default cap
 	}
 	switch strings.ToLower(argString(args, "format", "")) {
 	case "jpeg", "jpg":
@@ -395,21 +411,22 @@ func captureByTitle(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	if useGPU {
 		label += " [GPU]"
 	}
-	if len(matches) > 1 {
-		const maxList = 5
-		others := make([]string, 0, maxList)
-		for _, m := range matches[1:] {
-			if len(others) == maxList {
-				break
+	if others := len(matches) - 1; others > 0 {
+		// Listing every match by title clutters the chat once there are many, so
+		// only enumerate them when there are a handful; beyond that report just the
+		// count and how to disambiguate, omitting the names.
+		const maxList = 3
+		if others <= maxList {
+			named := make([]string, 0, others)
+			for _, m := range matches[1:] {
+				named = append(named, fmt.Sprintf("%q [hwnd 0x%x]", m.Title, m.Handle))
 			}
-			others = append(others, fmt.Sprintf("%q [hwnd 0x%x]", m.Title, m.Handle))
+			label = fmt.Sprintf("%s — %d other window(s) also matched: %s",
+				label, others, strings.Join(named, ", "))
+		} else {
+			label = fmt.Sprintf("%s — %d other windows also matched (narrow the title or set exact=true to disambiguate)",
+				label, others)
 		}
-		more := ""
-		if len(matches)-1 > len(others) {
-			more = fmt.Sprintf(" (+%d more)", len(matches)-1-len(others))
-		}
-		label = fmt.Sprintf("%s — %d other window(s) also matched: %s%s",
-			label, len(matches)-1, strings.Join(others, ", "), more)
 	}
 	return imageResult(buf, label, out)
 }

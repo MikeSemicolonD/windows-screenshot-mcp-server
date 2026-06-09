@@ -210,13 +210,18 @@ square of the scale factor, so it is the **highest-leverage option for agents** 
 only need to *see* a window rather than read fine text at full resolution.
 
 - `max_width` — downscale so the image is at most this many pixels wide, preserving
-  aspect ratio (e.g. `1280`). `0` or omitted means full resolution.
+  aspect ratio (e.g. `1280`). Pass `0` to force full resolution.
 - `scale` — a downscale factor between `0` and `1` (e.g. `0.5` = half width and height).
 
 If both are given, the smaller result wins. The image is **never upscaled**. When a
-capture is downscaled, the summary text notes it (e.g. `968x548 (downscaled from
-1936x1096)`). As a rough guide, a half-scale JPEG is on the order of ~20× smaller than
-a full-resolution PNG of the same window.
+capture is downscaled, the summary text notes it (e.g. `1280x725 (from 1936x1096
+capture)`). As a rough guide, a half-scale JPEG is on the order of ~20× smaller than a
+full-resolution PNG of the same window.
+
+> **Default cap.** Because full-resolution images dominate the round-trip latency for an
+> agent (transport + image tokens), a capture with **no sizing at all** (no `max_width`,
+> `scale`, or `region`) is capped to **1280px wide** by default. This keeps captures fast
+> out of the box; request full resolution explicitly with `max_width: 0`.
 
 #### Title matching (`capture_window_by_title`)
 
@@ -224,7 +229,9 @@ By default the `title` argument is a **case-insensitive substring** ("lazy") mat
 `"command"`, `"prompt"`, and `"Command Prompt"` all match a window titled
 *Command Prompt*. When several windows match, the best target is chosen (visible and
 non-minimized windows first, then an exact title match, then the shortest/closest
-title); other matches are listed in the result text so an agent can re-target.
+title); up to three other matches are listed in the result text so an agent can
+re-target, and when more than three also match only the count is reported (narrow the
+title or set `exact=true` to disambiguate) to keep the summary readable.
 
 Two independent flags tighten the match:
 
