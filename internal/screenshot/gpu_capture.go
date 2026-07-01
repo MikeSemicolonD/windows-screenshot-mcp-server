@@ -29,6 +29,7 @@ var (
 	d3d11   = windows.NewLazyDLL("d3d11.dll")
 
 	roInitialize           = combase.NewProc("RoInitialize")
+	roUninitialize         = combase.NewProc("RoUninitialize")
 	roGetActivationFactory = combase.NewProc("RoGetActivationFactory")
 	windowsCreateString    = combase.NewProc("WindowsCreateString")
 	windowsDeleteString    = combase.NewProc("WindowsDeleteString")
@@ -208,6 +209,12 @@ type gpuSession struct {
 	item      uintptr
 	framePool uintptr
 	session   uintptr
+	// roInitialized is true only when this session's RoInitialize added an
+	// apartment reference we own (S_OK/S_FALSE) and must balance with a matching
+	// RoUninitialize. It stays false when RoInitialize returned RPC_E_CHANGED_MODE
+	// (the thread was already initialized in another mode by someone else), so we
+	// never uninitialize an apartment we didn't reference.
+	roInitialized bool
 }
 
 // CaptureGPU captures a window using the Windows.Graphics.Capture API. handle
@@ -255,6 +262,10 @@ func (e *WindowsScreenshotEngine) NewGPUSession(handle uintptr, options *types.C
 
 	if hr, _, _ := roInitialize.Call(uintptr(roInitMultiThreaded)); failed(hr) && uint32(hr) != rpcEChangedMode {
 		return fail(fmt.Errorf("RoInitialize failed: 0x%08X", uint32(hr)))
+	} else if !failed(hr) {
+		// S_OK / S_FALSE both add a reference we must release; RPC_E_CHANGED_MODE
+		// (an error we tolerate above) does not, so only flag the owned cases.
+		s.roInitialized = true
 	}
 
 	// --- Direct3D 11 device ---
@@ -382,6 +393,11 @@ func (s *gpuSession) releaseAll() {
 	comRelease(s.item)
 	comRelease(s.context)
 	comRelease(s.device)
+	// Balance RoInitialize once every COM object is released, so the thread is
+	// handed back to the Go runtime's pool with a clean apartment reference count.
+	if s.roInitialized {
+		roUninitialize.Call()
+	}
 	*s = gpuSession{}
 }
 
@@ -467,7 +483,7 @@ func readTexture(device, context, texture uintptr) (*types.ScreenshotBuffer, err
 	data := make([]byte, stride*height)
 	srcPitch := int(mapped.RowPitch) // GPU row pitch can exceed width*4
 	for y := 0; y < height; y++ {
-		row := (*[1 << 30]byte)(unsafe.Pointer(mapped.PData + uintptr(y*srcPitch)))[:stride:stride]
+		row := unsafe.Slice((*byte)(unsafe.Pointer(mapped.PData+uintptr(y*srcPitch))), stride)
 		copy(data[y*stride:(y+1)*stride], row)
 	}
 

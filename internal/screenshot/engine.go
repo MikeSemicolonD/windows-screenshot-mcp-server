@@ -248,29 +248,43 @@ type monitorInfo struct {
 	isPrimary bool
 }
 
+// enumMonitorsContext accumulates monitors across a single EnumDisplayMonitors
+// pass. A pointer to it is threaded through the dwData parameter so the callback
+// can be a package-level function rather than a per-call closure — see
+// enumMonitorsCallback.
+type enumMonitorsContext struct {
+	monitors []monitorInfo
+}
+
+// enumMonitorsCallback is created exactly once. syscall.NewCallback allocates
+// from a small, process-wide pool that is never freed, so building a fresh
+// callback on every enumerateMonitors call (every capture_full_screen goes
+// through it) would exhaust the pool and panic. Hoisting it here and passing
+// state via dwData avoids that leak.
+var enumMonitorsCallback = syscall.NewCallback(func(hMonitor, hdcMonitor, lprcMonitor, dwData uintptr) uintptr {
+	ctx := (*enumMonitorsContext)(unsafe.Pointer(dwData))
+	var mi MONITORINFO
+	mi.CbSize = uint32(unsafe.Sizeof(mi))
+	ret, _, _ := getMonitorInfoW.Call(hMonitor, uintptr(unsafe.Pointer(&mi)))
+	if ret != 0 {
+		ctx.monitors = append(ctx.monitors, monitorInfo{
+			rect:      mi.RcMonitor,
+			isPrimary: mi.DwFlags&MONITORINFOF_PRIMARY != 0,
+		})
+	}
+	return 1 // continue enumeration
+})
+
 // enumerateMonitors returns every connected monitor. The slice is ordered so
 // that index 0 is the primary display, with the remaining monitors sorted
 // left-to-right then top-to-bottom by their virtual-screen position.
 func (e *WindowsScreenshotEngine) enumerateMonitors() ([]monitorInfo, error) {
-	var monitors []monitorInfo
-
-	callback := syscall.NewCallback(func(hMonitor, hdcMonitor, lprcMonitor, dwData uintptr) uintptr {
-		var mi MONITORINFO
-		mi.CbSize = uint32(unsafe.Sizeof(mi))
-		ret, _, _ := getMonitorInfoW.Call(hMonitor, uintptr(unsafe.Pointer(&mi)))
-		if ret != 0 {
-			monitors = append(monitors, monitorInfo{
-				rect:      mi.RcMonitor,
-				isPrimary: mi.DwFlags&MONITORINFOF_PRIMARY != 0,
-			})
-		}
-		return 1 // continue enumeration
-	})
-
-	ret, _, _ := enumDisplayMonitors.Call(0, 0, callback, 0)
+	ctx := &enumMonitorsContext{}
+	ret, _, _ := enumDisplayMonitors.Call(0, 0, enumMonitorsCallback, uintptr(unsafe.Pointer(ctx)))
 	if ret == 0 {
 		return nil, fmt.Errorf("EnumDisplayMonitors failed")
 	}
+	monitors := ctx.monitors
 	if len(monitors) == 0 {
 		return nil, fmt.Errorf("no monitors found")
 	}
@@ -604,35 +618,46 @@ func (e *WindowsScreenshotEngine) findWindowByClassName(className string) (uintp
 	return handle, nil
 }
 
-func (e *WindowsScreenshotEngine) findWindowByPID(targetPID uint32) (uintptr, error) {
-	var foundHandle uintptr
+// findWindowByPIDContext carries the target PID and the found handle across an
+// EnumWindows pass. See findWindowByPIDCallback for why the callback is
+// package-level.
+type findWindowByPIDContext struct {
+	targetPID   uint32
+	foundHandle uintptr
+}
 
-	// Callback function for EnumWindows
-	callback := syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
-		var pid uint32
-		getWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
+// findWindowByPIDCallback is created exactly once. syscall.NewCallback draws
+// from a small, process-wide pool that is never freed, so a fresh per-call
+// callback would eventually exhaust it and panic; state is passed via lParam
+// instead.
+var findWindowByPIDCallback = syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
+	ctx := (*findWindowByPIDContext)(unsafe.Pointer(lParam))
+	var pid uint32
+	getWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
 
-		if pid == targetPID {
-			// Check if window is visible and has a title
-			visible, _, _ := isWindowVisible.Call(hwnd)
-			if visible != 0 {
-				titleLen, _, _ := getWindowTextLengthW.Call(hwnd)
-				if titleLen > 0 {
-					foundHandle = hwnd
-					return 0 // Stop enumeration
-				}
+	if pid == ctx.targetPID {
+		// Check if window is visible and has a title
+		visible, _, _ := isWindowVisible.Call(hwnd)
+		if visible != 0 {
+			titleLen, _, _ := getWindowTextLengthW.Call(hwnd)
+			if titleLen > 0 {
+				ctx.foundHandle = hwnd
+				return 0 // Stop enumeration
 			}
 		}
-		return 1 // Continue enumeration
-	})
+	}
+	return 1 // Continue enumeration
+})
 
-	enumWindows.Call(callback, 0)
+func (e *WindowsScreenshotEngine) findWindowByPID(targetPID uint32) (uintptr, error) {
+	ctx := &findWindowByPIDContext{targetPID: targetPID}
+	enumWindows.Call(findWindowByPIDCallback, uintptr(unsafe.Pointer(ctx)))
 
-	if foundHandle == 0 {
+	if ctx.foundHandle == 0 {
 		return 0, fmt.Errorf("no visible window found for PID %d", targetPID)
 	}
 
-	return foundHandle, nil
+	return ctx.foundHandle, nil
 }
 
 func (e *WindowsScreenshotEngine) getWindowInfo(handle uintptr) (*types.WindowInfo, error) {

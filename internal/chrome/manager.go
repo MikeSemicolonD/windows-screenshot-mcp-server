@@ -203,48 +203,58 @@ func (cm *ChromeManager) ExecuteScript(tab *types.ChromeTab, script string) (int
 	return cm.executeScript(conn, responses, script)
 }
 
-// findChromeProcesses finds all Chrome process IDs
-func (cm *ChromeManager) findChromeProcesses() ([]uint32, error) {
-	var pids []uint32
-	
-	// Callback for EnumWindows to find Chrome windows
-	callback := syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
-		var pid uint32
-		getWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
-		
-		// Check if window class is Chrome
-		classBuf := make([]uint16, 256)
-		getClassName.Call(hwnd, uintptr(unsafe.Pointer(&classBuf[0])), 256)
-		className := syscall.UTF16ToString(classBuf)
-		
-		// Chrome window classes
-		if strings.Contains(className, "Chrome_WidgetWin") {
-			// Check if this PID is already in our list
-			found := false
-			for _, existingPID := range pids {
-				if existingPID == pid {
-					found = true
-					break
-				}
-			}
-			if !found {
-				// Verify it's actually Chrome by checking process name
-				if cm.isChromePID(pid) {
-					pids = append(pids, pid)
-				}
+// findChromeProcessesContext accumulates Chrome PIDs across an EnumWindows pass.
+// See findChromeProcessesCallback for why the callback is package-level.
+type findChromeProcessesContext struct {
+	manager *ChromeManager
+	pids    []uint32
+}
+
+// findChromeProcessesCallback is created exactly once. syscall.NewCallback draws
+// from a small, process-wide pool that is never freed, so a fresh per-call
+// callback would eventually exhaust it and panic; state is passed via lParam
+// instead.
+var findChromeProcessesCallback = syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
+	ctx := (*findChromeProcessesContext)(unsafe.Pointer(lParam))
+	var pid uint32
+	getWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
+
+	// Check if window class is Chrome
+	classBuf := make([]uint16, 256)
+	getClassName.Call(hwnd, uintptr(unsafe.Pointer(&classBuf[0])), 256)
+	className := syscall.UTF16ToString(classBuf)
+
+	// Chrome window classes
+	if strings.Contains(className, "Chrome_WidgetWin") {
+		// Check if this PID is already in our list
+		found := false
+		for _, existingPID := range ctx.pids {
+			if existingPID == pid {
+				found = true
+				break
 			}
 		}
-		
-		return 1 // Continue enumeration
-	})
-	
-	enumWindows.Call(callback, 0)
-	
-	if len(pids) == 0 {
+		if !found {
+			// Verify it's actually Chrome by checking process name
+			if ctx.manager.isChromePID(pid) {
+				ctx.pids = append(ctx.pids, pid)
+			}
+		}
+	}
+
+	return 1 // Continue enumeration
+})
+
+// findChromeProcesses finds all Chrome process IDs
+func (cm *ChromeManager) findChromeProcesses() ([]uint32, error) {
+	ctx := &findChromeProcessesContext{manager: cm}
+	enumWindows.Call(findChromeProcessesCallback, uintptr(unsafe.Pointer(ctx)))
+
+	if len(ctx.pids) == 0 {
 		return nil, fmt.Errorf("no Chrome processes found")
 	}
-	
-	return pids, nil
+
+	return ctx.pids, nil
 }
 
 // isChromePID verifies if a PID belongs to Chrome

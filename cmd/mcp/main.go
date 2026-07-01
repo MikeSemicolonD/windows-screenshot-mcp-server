@@ -334,10 +334,12 @@ func captureWithTimeout(d time.Duration, fn func() (*types.ScreenshotBuffer, err
 		buf, err := fn()
 		ch <- result{buf, err}
 	}()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
 	select {
 	case r := <-ch:
 		return r.buf, r.err
-	case <-time.After(d):
+	case <-timer.C:
 		return nil, fmt.Errorf("capture timed out after %s — the target window is unresponsive or closing", d)
 	}
 }

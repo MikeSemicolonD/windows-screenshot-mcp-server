@@ -121,41 +121,54 @@ type THREADENTRY32 struct {
 	dwFlags            uint32
 }
 
+// enumProcessWindowsContext filters an EnumWindows pass down to one process.
+// See enumProcessWindowsCallback for why the callback is package-level.
+type enumProcessWindowsContext struct {
+	engine  *WindowsScreenshotEngine
+	pid     uint32
+	windows []types.WindowInfo
+}
+
+// enumProcessWindowsCallback is created exactly once. syscall.NewCallback draws
+// from a small, process-wide pool that is never freed, so a fresh per-call
+// callback would eventually exhaust it and panic; state is passed via lParam
+// instead.
+var enumProcessWindowsCallback = syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
+	ctx := (*enumProcessWindowsContext)(unsafe.Pointer(lParam))
+	var windowPID uint32
+	getWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&windowPID)))
+
+	if windowPID == ctx.pid {
+		if info, err := ctx.engine.getWindowInfo(hwnd); err == nil {
+			ctx.windows = append(ctx.windows, *info)
+		}
+	}
+	return 1 // Continue enumeration
+})
+
 // EnumerateAllProcessWindows finds all windows belonging to a specific process
 func (e *WindowsScreenshotEngine) EnumerateAllProcessWindows(pid uint32) ([]types.WindowInfo, error) {
-	var windows []types.WindowInfo
-	
 	// Find all threads for this process
 	threads, err := e.getProcessThreads(pid)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get process threads: %w", err)
 	}
-	
+
+	ctx := &enumProcessWindowsContext{engine: e, pid: pid}
+
 	// Enumerate windows for each thread
 	for _, threadID := range threads {
 		threadWindows, err := e.enumerateThreadWindows(threadID)
 		if err != nil {
 			continue // Skip threads that fail
 		}
-		windows = append(windows, threadWindows...)
+		ctx.windows = append(ctx.windows, threadWindows...)
 	}
-	
+
 	// Also try standard EnumWindows with PID filtering
-	callback := syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
-		var windowPID uint32
-		getWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&windowPID)))
-		
-		if windowPID == pid {
-			if info, err := e.getWindowInfo(hwnd); err == nil {
-				windows = append(windows, *info)
-			}
-		}
-		return 1 // Continue enumeration
-	})
-	
-	enumWindows.Call(callback, 0)
-	
-	return e.deduplicateWindows(windows), nil
+	enumWindows.Call(enumProcessWindowsCallback, uintptr(unsafe.Pointer(ctx)))
+
+	return e.deduplicateWindows(ctx.windows), nil
 }
 
 // FindSystemTrayApps discovers applications running in the system tray
@@ -191,58 +204,112 @@ func (e *WindowsScreenshotEngine) FindSystemTrayApps() ([]types.WindowInfo, erro
 	return trayApps, nil
 }
 
-// FindHiddenWindows discovers windows that are hidden but not minimized
-func (e *WindowsScreenshotEngine) FindHiddenWindows() ([]types.WindowInfo, error) {
-	var hiddenWindows []types.WindowInfo
-	
-	callback := syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
-		visible, _, _ := isWindowVisible.Call(hwnd)
-		iconic, _, _ := isIconic.Call(hwnd)
-		
-		// Window exists but is not visible and not minimized
-		if visible == 0 && iconic == 0 {
-			if info, err := e.getWindowInfo(hwnd); err == nil {
-				// Filter out system windows with no title
-				if info.Title != "" || len(info.ClassName) > 0 {
-					hiddenWindows = append(hiddenWindows, *info)
-				}
+// enumEngineWindowsContext accumulates windows during an EnumWindows pass for a
+// callback that only needs the engine plus a result slice. Shared by
+// FindHiddenWindows, FindCloakedWindows and enumerateThreadWindows.
+type enumEngineWindowsContext struct {
+	engine  *WindowsScreenshotEngine
+	windows []types.WindowInfo
+}
+
+// findHiddenWindowsCallback is created exactly once (see the pool note on
+// enumProcessWindowsCallback); state is passed via lParam.
+var findHiddenWindowsCallback = syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
+	ctx := (*enumEngineWindowsContext)(unsafe.Pointer(lParam))
+	visible, _, _ := isWindowVisible.Call(hwnd)
+	iconic, _, _ := isIconic.Call(hwnd)
+
+	// Window exists but is not visible and not minimized
+	if visible == 0 && iconic == 0 {
+		if info, err := ctx.engine.getWindowInfo(hwnd); err == nil {
+			// Filter out system windows with no title
+			if info.Title != "" || len(info.ClassName) > 0 {
+				ctx.windows = append(ctx.windows, *info)
 			}
 		}
-		return 1 // Continue enumeration
-	})
-	
-	enumWindows.Call(callback, 0)
-	
-	return hiddenWindows, nil
+	}
+	return 1 // Continue enumeration
+})
+
+// FindHiddenWindows discovers windows that are hidden but not minimized
+func (e *WindowsScreenshotEngine) FindHiddenWindows() ([]types.WindowInfo, error) {
+	ctx := &enumEngineWindowsContext{engine: e}
+	enumWindows.Call(findHiddenWindowsCallback, uintptr(unsafe.Pointer(ctx)))
+	return ctx.windows, nil
 }
+
+// findCloakedWindowsCallback is created exactly once (see the pool note on
+// enumProcessWindowsCallback); state is passed via lParam.
+var findCloakedWindowsCallback = syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
+	ctx := (*enumEngineWindowsContext)(unsafe.Pointer(lParam))
+	var cloaked uint32
+	ret, _, _ := dwmGetWindowAttribute.Call(
+		hwnd,
+		DWMWA_CLOAKED,
+		uintptr(unsafe.Pointer(&cloaked)),
+		unsafe.Sizeof(cloaked),
+	)
+
+	// Window is cloaked by DWM
+	if ret == 0 && cloaked != 0 {
+		if info, err := ctx.engine.getWindowInfo(hwnd); err == nil {
+			info.State = "cloaked"
+			ctx.windows = append(ctx.windows, *info)
+		}
+	}
+	return 1 // Continue enumeration
+})
 
 // FindCloakedWindows discovers windows that are cloaked by DWM (UWP apps, etc.)
 func (e *WindowsScreenshotEngine) FindCloakedWindows() ([]types.WindowInfo, error) {
-	var cloakedWindows []types.WindowInfo
-	
-	callback := syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
-		var cloaked uint32
-		ret, _, _ := dwmGetWindowAttribute.Call(
-			hwnd,
-			DWMWA_CLOAKED,
-			uintptr(unsafe.Pointer(&cloaked)),
-			unsafe.Sizeof(cloaked),
-		)
-		
-		// Window is cloaked by DWM
-		if ret == 0 && cloaked != 0 {
-			if info, err := e.getWindowInfo(hwnd); err == nil {
-				info.State = "cloaked"
-				cloakedWindows = append(cloakedWindows, *info)
-			}
-		}
-		return 1 // Continue enumeration
-	})
-	
-	enumWindows.Call(callback, 0)
-	
-	return cloakedWindows, nil
+	ctx := &enumEngineWindowsContext{engine: e}
+	enumWindows.Call(findCloakedWindowsCallback, uintptr(unsafe.Pointer(ctx)))
+	return ctx.windows, nil
 }
+
+// findByTitleContext carries the search parameters and accumulates matches
+// across a single EnumWindows pass. A pointer to it is threaded through the
+// EnumWindows lParam so the callback can be a package-level function rather than
+// a per-call closure — see findByTitleCallback.
+type findByTitleContext struct {
+	engine        *WindowsScreenshotEngine
+	needle        string // already lower-cased when caseSensitive is false
+	caseSensitive bool
+	exact         bool
+	matches       []types.WindowInfo
+}
+
+// findByTitleCallback is created exactly once. syscall.NewCallback allocates
+// from a small, process-wide pool that is never freed, so building a fresh
+// callback on every FindWindowsByTitle call (a hot path — every
+// capture_window_by_title goes through it) would exhaust the pool and panic
+// after ~1–2k captures. Hoisting it here and passing state via lParam avoids
+// that leak.
+var findByTitleCallback = syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
+	ctx := (*findByTitleContext)(unsafe.Pointer(lParam))
+	titleLen, _, _ := getWindowTextLengthW.Call(hwnd)
+	if titleLen == 0 {
+		return 1 // skip windows with no title
+	}
+	info, err := ctx.engine.getWindowInfo(hwnd)
+	if err != nil || info.Title == "" {
+		return 1
+	}
+	hay := info.Title
+	if !ctx.caseSensitive {
+		hay = strings.ToLower(hay)
+	}
+	var hit bool
+	if ctx.exact {
+		hit = hay == ctx.needle
+	} else {
+		hit = ctx.needle == "" || strings.Contains(hay, ctx.needle)
+	}
+	if hit {
+		ctx.matches = append(ctx.matches, *info)
+	}
+	return 1 // continue enumeration
+})
 
 // FindWindowsByTitle returns every top-level window whose title matches needle.
 // The flags are independent: caseSensitive controls whether the comparison
@@ -257,32 +324,14 @@ func (e *WindowsScreenshotEngine) FindWindowsByTitle(needle string, caseSensitiv
 		want = strings.ToLower(needle)
 	}
 
-	var matches []types.WindowInfo
-	callback := syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
-		titleLen, _, _ := getWindowTextLengthW.Call(hwnd)
-		if titleLen == 0 {
-			return 1 // skip windows with no title
-		}
-		info, err := e.getWindowInfo(hwnd)
-		if err != nil || info.Title == "" {
-			return 1
-		}
-		hay := info.Title
-		if !caseSensitive {
-			hay = strings.ToLower(hay)
-		}
-		var hit bool
-		if exact {
-			hit = hay == want
-		} else {
-			hit = want == "" || strings.Contains(hay, want)
-		}
-		if hit {
-			matches = append(matches, *info)
-		}
-		return 1 // continue enumeration
-	})
-	enumWindows.Call(callback, 0)
+	ctx := &findByTitleContext{
+		engine:        e,
+		needle:        want,
+		caseSensitive: caseSensitive,
+		exact:         exact,
+	}
+	enumWindows.Call(findByTitleCallback, uintptr(unsafe.Pointer(ctx)))
+	matches := ctx.matches
 
 	// rank yields a sort key: lower is a better capture target.
 	rank := func(w types.WindowInfo) (usable, exactMatch, length int) {
@@ -689,19 +738,20 @@ func (e *WindowsScreenshotEngine) getProcessThreads(pid uint32) ([]uint32, error
 	return threads, nil
 }
 
+// enumThreadWindowsCallback is created exactly once (see the pool note on
+// enumProcessWindowsCallback); state is passed via lParam.
+var enumThreadWindowsCallback = syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
+	ctx := (*enumEngineWindowsContext)(unsafe.Pointer(lParam))
+	if info, err := ctx.engine.getWindowInfo(hwnd); err == nil {
+		ctx.windows = append(ctx.windows, *info)
+	}
+	return 1 // Continue enumeration
+})
+
 func (e *WindowsScreenshotEngine) enumerateThreadWindows(threadID uint32) ([]types.WindowInfo, error) {
-	var windows []types.WindowInfo
-	
-	callback := syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
-		if info, err := e.getWindowInfo(hwnd); err == nil {
-			windows = append(windows, *info)
-		}
-		return 1 // Continue enumeration
-	})
-	
-	enumThreadWindows.Call(uintptr(threadID), callback, 0)
-	
-	return windows, nil
+	ctx := &enumEngineWindowsContext{engine: e}
+	enumThreadWindows.Call(uintptr(threadID), enumThreadWindowsCallback, uintptr(unsafe.Pointer(ctx)))
+	return ctx.windows, nil
 }
 
 func (e *WindowsScreenshotEngine) findWindow(className, windowName string) (uintptr, error) {
@@ -735,44 +785,55 @@ func (e *WindowsScreenshotEngine) findWindow(className, windowName string) (uint
 	return handle, nil
 }
 
+// findChildWindowContext carries the match criteria and the found handle across
+// an EnumChildWindows pass. See findChildWindowCallback for why the callback is
+// package-level.
+type findChildWindowContext struct {
+	className  string
+	windowName string
+	found      uintptr
+}
+
+// findChildWindowCallback is created exactly once (see the pool note on
+// enumProcessWindowsCallback); state is passed via lParam.
+var findChildWindowCallback = syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
+	ctx := (*findChildWindowContext)(unsafe.Pointer(lParam))
+	if ctx.className != "" {
+		classBuf := make([]uint16, 256)
+		getClassName.Call(hwnd, uintptr(unsafe.Pointer(&classBuf[0])), 256)
+		actualClass := syscall.UTF16ToString(classBuf)
+		if actualClass != ctx.className {
+			return 1 // Continue
+		}
+	}
+
+	if ctx.windowName != "" {
+		titleLen, _, _ := getWindowTextLengthW.Call(hwnd)
+		if titleLen > 0 {
+			titleBuf := make([]uint16, titleLen+1)
+			getWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&titleBuf[0])), uintptr(len(titleBuf)))
+			actualName := syscall.UTF16ToString(titleBuf)
+			if actualName != ctx.windowName {
+				return 1 // Continue
+			}
+		} else {
+			return 1 // Continue
+		}
+	}
+
+	ctx.found = hwnd
+	return 0 // Stop enumeration
+})
+
 func (e *WindowsScreenshotEngine) findChildWindow(parent uintptr, className, windowName string) (uintptr, error) {
-	var found uintptr
-	
-	callback := syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
-		if className != "" {
-			classBuf := make([]uint16, 256)
-			getClassName.Call(hwnd, uintptr(unsafe.Pointer(&classBuf[0])), 256)
-			actualClass := syscall.UTF16ToString(classBuf)
-			if actualClass != className {
-				return 1 // Continue
-			}
-		}
-		
-		if windowName != "" {
-			titleLen, _, _ := getWindowTextLengthW.Call(hwnd)
-			if titleLen > 0 {
-				titleBuf := make([]uint16, titleLen+1)
-				getWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&titleBuf[0])), uintptr(len(titleBuf)))
-				actualName := syscall.UTF16ToString(titleBuf)
-				if actualName != windowName {
-					return 1 // Continue
-				}
-			} else if windowName != "" {
-				return 1 // Continue
-			}
-		}
-		
-		found = hwnd
-		return 0 // Stop enumeration
-	})
-	
-	enumChildWindows.Call(parent, callback, 0)
-	
-	if found == 0 {
+	ctx := &findChildWindowContext{className: className, windowName: windowName}
+	enumChildWindows.Call(parent, findChildWindowCallback, uintptr(unsafe.Pointer(ctx)))
+
+	if ctx.found == 0 {
 		return 0, fmt.Errorf("child window not found")
 	}
-	
-	return found, nil
+
+	return ctx.found, nil
 }
 
 func (e *WindowsScreenshotEngine) getTrayProcesses(toolbarWnd uintptr) []uint32 {

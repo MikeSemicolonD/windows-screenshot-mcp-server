@@ -156,36 +156,50 @@ func NewManager() *WindowsManager {
 	}
 }
 
-// EnumerateWindows lists all windows with optional filtering
-func (wm *WindowsManager) EnumerateWindows(filter *types.WindowFilter) ([]types.WindowInfo, error) {
-	var windows []types.WindowInfo
-	var zOrder int
+// enumerateWindowsContext carries the filter and accumulates results across an
+// EnumWindows pass. See enumerateWindowsCallback for why the callback is
+// package-level.
+type enumerateWindowsContext struct {
+	manager *WindowsManager
+	filter  *types.WindowFilter
+	zOrder  int
+	windows []types.WindowInfo
+}
 
-	// Callback function for EnumWindows
-	callback := syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
-		windowInfo, err := wm.getWindowInfoDetailed(hwnd, zOrder)
-		if err != nil {
+// enumerateWindowsCallback is created exactly once. syscall.NewCallback draws
+// from a small, process-wide pool that is never freed, so a fresh per-call
+// callback would eventually exhaust it and panic; state is passed via lParam
+// instead.
+var enumerateWindowsCallback = syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
+	ctx := (*enumerateWindowsContext)(unsafe.Pointer(lParam))
+	windowInfo, err := ctx.manager.getWindowInfoDetailed(hwnd, ctx.zOrder)
+	if err != nil {
+		return 1 // Continue enumeration
+	}
+
+	// Apply filters
+	if ctx.filter != nil {
+		if !ctx.manager.matchesFilter(windowInfo, ctx.filter) {
+			ctx.zOrder++
 			return 1 // Continue enumeration
 		}
+	}
 
-		// Apply filters
-		if filter != nil {
-			if !wm.matchesFilter(windowInfo, filter) {
-				zOrder++
-				return 1 // Continue enumeration
-			}
-		}
+	ctx.windows = append(ctx.windows, *windowInfo)
+	ctx.zOrder++
+	return 1 // Continue enumeration
+})
 
-		windows = append(windows, *windowInfo)
-		zOrder++
-		return 1 // Continue enumeration
-	})
+// EnumerateWindows lists all windows with optional filtering
+func (wm *WindowsManager) EnumerateWindows(filter *types.WindowFilter) ([]types.WindowInfo, error) {
+	ctx := &enumerateWindowsContext{manager: wm, filter: filter}
 
 	// Enumerate all top-level windows
-	ret, _, _ := enumWindows.Call(callback, 0)
+	ret, _, _ := enumWindows.Call(enumerateWindowsCallback, uintptr(unsafe.Pointer(ctx)))
 	if ret == 0 {
 		return nil, fmt.Errorf("EnumWindows failed")
 	}
+	windows := ctx.windows
 
 	// Sort by z-order if requested
 	sort.Slice(windows, func(i, j int) bool {
