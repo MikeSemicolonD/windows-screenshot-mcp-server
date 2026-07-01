@@ -220,7 +220,11 @@ func outputFromArgs(args map[string]any, defaultFormat types.ImageFormat) output
 		quality: int(argInt64(args, "quality", 90)),
 		region:  regionFromArgs(args),
 	}
-	if v, ok := args["scale"].(float64); ok {
+	// Only a scale in the documented (0,1) range counts as sizing. The encoder
+	// ignores out-of-range values, so accepting e.g. scale: 2 here would both
+	// skip the resize and suppress the default cap below — yielding an
+	// unintended full-resolution payload. Treat anything else as unset.
+	if v, ok := args["scale"].(float64); ok && v > 0 && v < 1 {
 		o.scale = v
 	}
 	_, hasMaxWidth := args["max_width"]
@@ -311,7 +315,20 @@ const (
 	// burstAbortAfter stops a burst once this many consecutive frames fail, so a
 	// window that closes mid-burst yields one quick error instead of N timeouts.
 	burstAbortAfter = 3
+	// maxInFlightCaptures bounds how many blocking capture syscalls may run at
+	// once. A capture that overruns its deadline is abandoned in its goroutine,
+	// but the underlying syscall cannot be cancelled, so that goroutine stays
+	// parked until (if ever) the syscall returns. This cap is therefore also the
+	// ceiling on how many such stuck goroutines can accumulate: a slot is held
+	// until the syscall actually returns, and once all slots are taken new
+	// captures fail fast instead of piling up unbounded.
+	maxInFlightCaptures = 8
 )
+
+// captureSlots is the concurrency limiter behind maxInFlightCaptures. A token is
+// held for the full lifetime of the blocking capture goroutine (released only
+// when the syscall returns), not merely until captureWithTimeout returns.
+var captureSlots = make(chan struct{}, maxInFlightCaptures)
 
 // captureWithTimeout runs a blocking capture under a deadline. If the capture
 // overruns, it returns a timeout error and abandons the work in its goroutine —
@@ -319,13 +336,28 @@ const (
 // instead of freezing. A panic in the capture is recovered into an error so a
 // bad handle can never crash the server. The channel is buffered so the
 // abandoned goroutine can still send (and exit) once the syscall returns.
+//
+// A maxInFlightCaptures semaphore bounds how many such (possibly stuck)
+// goroutines can exist at once; when it is saturated the call fails fast rather
+// than launching another goroutine that might never return.
 func captureWithTimeout(d time.Duration, fn func() (*types.ScreenshotBuffer, error)) (*types.ScreenshotBuffer, error) {
+	select {
+	case captureSlots <- struct{}{}:
+		// slot acquired; released by the goroutine below once fn actually returns
+	default:
+		return nil, fmt.Errorf("too many captures in flight (%d) — a target window is likely hung; retry shortly or restart the server", maxInFlightCaptures)
+	}
+
 	type result struct {
 		buf *types.ScreenshotBuffer
 		err error
 	}
 	ch := make(chan result, 1)
 	go func() {
+		// Release the slot only when the (uncancellable) capture actually
+		// returns, so a goroutine still parked after a timeout keeps holding its
+		// slot — that is what makes the cap bound total stuck goroutines.
+		defer func() { <-captureSlots }()
 		defer func() {
 			if r := recover(); r != nil {
 				ch <- result{nil, fmt.Errorf("capture panicked: %v", r)}
